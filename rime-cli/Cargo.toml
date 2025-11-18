@@ -1,0 +1,22 @@
+[package]
+name = "rime-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { workspace = true }
+rime-core = { path = "../rime-core" }
+rime-lightclient = { path = "../rime-lightclient" }
+rpassword = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bip0039 = { workspace = true }
+tracing-appender = "0.2"
+zcash_keys = { version = "0.12" }
+zcash_primitives = { workspace = true }
+sapling = { workspace = true }
+indicatif = "0.17"
+prettytable = { package = "prettytable-rs", version = "0.10" }
+serde_json = { workspace = true }
+hex = { workspace = true }

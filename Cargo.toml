@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "rime-core",
+    "rime-lightclient",
+    "rime-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+authors = ["Tanya tanyaarora@tutamail.com"]
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+argon2 = "0.5"
+bech32 = "0.9"
+bip0039 = "0.12"
+blake2b_simd = "1"
+bls12_381 = "0.8"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+ff = "0.13"
+halo2_gadgets = "0.3"
+halo2_proofs = "0.3"
+hex = "0.4"
+incrementalmerkletree = "0.8.2"
+jubjub = "0.10"
+lazy_static = "1"
+num-bigint = "0.4"
+num-traits = "0.2"
+orchard = "0.11"
+rand = "0.8"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sapling = { package = "sapling-crypto", version = "0.5" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2.5"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+equihash = "0.2"
+zcash_address = "0.4"
+zcash_note_encryption = "0.4.1"
+zcash_primitives = { version = "0.26.1", features = ["test-dependencies"] }
+zcash_protocol = "0.7.1"
+zeroize = "1"
+zip32 = "0.2"
