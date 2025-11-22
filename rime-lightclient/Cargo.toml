@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 reqwest = { workspace = true }
 rime-core = { path = "../rime-core" }
+rime-pir = { path = "../rime-pir" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +17,13 @@ prost-types = "0.12"
 futures = "0.3"
 async-trait = "0.1"
 tracing = { workspace = true }
+arti-client = { workspace = true }
+tor-rtcompat = { workspace = true }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
 
 zcash_client_backend = { version = "0.21", default-features = false, features = ["sync", "lightwalletd-tonic-transport"] }
 zcash_client_sqlite = { version = "0.19", default-features = false }
@@ -43,3 +51,4 @@ tonic-build = "0.10"
 tempfile = "3"
 jubjub = "0.10"
 ff = "0.13"
+redjubjub = "0.8"

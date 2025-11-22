@@ -1,6 +1,6 @@
 use std::{
     error::Error,
-    fs,
+    fmt, fs,
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
@@ -10,7 +10,8 @@ use std::{
 };
 
 use bip0039::{Count, English, Mnemonic};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use humantime::parse_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use prettytable::{Cell, Row, Table};
 use rime_core::{
@@ -18,24 +19,28 @@ use rime_core::{
     keys::KeyManager,
     notes::Pool,
     tree::{NoteCommitmentTree, OrchardNoteCommitmentTree},
-    Network, Wallet, WalletMetadata, WalletSeed, WalletStore,
+    FullMemoConfig, Network, PirConfig, PirServerConfig, PrivacyConfig, SyncMode, Wallet,
+    WalletMetadata, WalletSeed, WalletStore,
 };
-use rime_lightclient::{rpc::RpcConfig, GrpcRpcClient, WalletSyncer};
+use rime_lightclient::{
+    create_pir_source, estimate_full_memo_bandwidth, rpc::RpcConfig, GrpcNoteSource, GrpcRpcClient,
+    NoteSource, PirNoteSource, RpcClient, TorConfig as LiteTorConfig, TorManager, WalletSyncer,
+};
 use rpassword::prompt_password;
 use sapling::PaymentAddress as SaplingPaymentAddress;
 use serde_json::json;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 use zcash_keys::encoding::encode_payment_address_p;
 use zcash_primitives::consensus::{MainNetwork, TestNetwork};
 
 #[derive(Parser)]
 #[command(
     name = "rime-cli",
-    about = "RIME Unified Address light client (ZIP-316) with receive-only Sapling + Orchard support",
+    about = "RIME - A privacy-hardened Unified Addresses light client for Zcash.",
     version
 )]
 struct Cli {
@@ -69,10 +74,51 @@ struct InitArgs {
 
 #[derive(Debug, Args)]
 struct SyncArgs {
-    #[arg(short, long, default_value = "http://localhost:8232")]
+    #[arg(short, long, default_value = "https://testnet.zec.rocks:443")]
     endpoint: String,
     #[arg(short, long, default_value_t = 100)]
     batch: u32,
+    #[arg(
+        short = 'm',
+        long = "sync-mode",
+        value_enum,
+        value_name = "mode",
+        help = "Select how to sync and fetch shielded outputs"
+    )]
+    sync_mode: Option<CliSyncMode>,
+    #[arg(
+        long = "pir-server",
+        value_name = "url",
+        help = "Add a PIR server endpoint (repeatable)",
+        action = ArgAction::Append
+    )]
+    pir_servers: Vec<String>,
+    #[arg(
+        long = "pir-dummy-interval",
+        value_name = "duration",
+        help = "Interval between constant-rate PIR queries (eg 30s, 1m)"
+    )]
+    pir_dummy_interval: Option<String>,
+    #[arg(
+        long = "pir-bucket-size",
+        value_name = "n",
+        help = "Number of outputs per PIR bucket (default: 1000)"
+    )]
+    pir_bucket_size: Option<usize>,
+    #[arg(long = "tor-only", help = "Require all network activity to use Tor")]
+    tor_only: bool,
+    #[arg(
+        long = "tor-state-dir",
+        value_name = "path",
+        help = "Path to Tor state directory (default: <data_dir>/tor/state)"
+    )]
+    tor_state_dir: Option<PathBuf>,
+    #[arg(
+        long = "tor-cache-dir",
+        value_name = "path",
+        help = "Path to Tor cache directory (default: <data_dir>/tor/cache)"
+    )]
+    tor_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -87,6 +133,26 @@ struct BalanceArgs {
 enum BalancePool {
     Sapling,
     Orchard,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliSyncMode {
+    /// standard lightwalletd sync, selective memo fetching
+    Normal,
+    /// download all memos in synced blocks
+    FullMemo,
+    /// use PIR to fetch outputs obliviously with dummy queries
+    Pir,
+}
+
+impl From<CliSyncMode> for SyncMode {
+    fn from(value: CliSyncMode) -> Self {
+        match value {
+            CliSyncMode::Normal => SyncMode::Normal,
+            CliSyncMode::FullMemo => SyncMode::FullMemo,
+            CliSyncMode::Pir => SyncMode::Pir,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -126,7 +192,121 @@ impl From<CliNetwork> for Network {
     }
 }
 
+impl SyncArgs {
+    fn privacy_config(&self) -> Result<PrivacyConfig, CliConfigError> {
+        let cli_mode = self.sync_mode.unwrap_or(CliSyncMode::Normal);
+        let sync_mode = SyncMode::from(cli_mode);
+        if !matches!(sync_mode, SyncMode::Pir) {
+            self.ensure_no_pir_flags()?;
+        }
+        let mut config = PrivacyConfig {
+            sync_mode,
+            tor_only: self.tor_only,
+            tor_state_dir: self
+                .tor_state_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            tor_cache_dir: self
+                .tor_cache_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            ..PrivacyConfig::default()
+        };
+        match sync_mode {
+            SyncMode::Normal => {}
+            SyncMode::FullMemo => {
+                config.full_memo = Some(FullMemoConfig {
+                    require_confirmation: false,
+                });
+            }
+            SyncMode::Pir => {
+                let mut pir_config = PirConfig {
+                    servers: self.parse_pir_servers()?,
+                    dummy_interval: self.parse_pir_dummy_interval()?,
+                    ..PirConfig::default()
+                };
+                if let Some(size) = self.pir_bucket_size {
+                    if size == 0 {
+                        return Err(CliConfigError::new(
+                            "--pir-bucket-size must be greater than zero",
+                        ));
+                    }
+                    pir_config.bucket_size = size;
+                }
+                config.pir = Some(pir_config);
+            }
+        }
+        config
+            .validate()
+            .map_err(|err| CliConfigError::new(err.to_string()))?;
+        Ok(config)
+    }
+
+    fn ensure_no_pir_flags(&self) -> Result<(), CliConfigError> {
+        if !self.pir_servers.is_empty()
+            || self.pir_dummy_interval.is_some()
+            || self.pir_bucket_size.is_some()
+        {
+            return Err(CliConfigError::new("--pir-* flags require --sync-mode pir"));
+        }
+        Ok(())
+    }
+
+    fn parse_pir_servers(&self) -> Result<Vec<PirServerConfig>, CliConfigError> {
+        if self.pir_servers.len() < 2 {
+            return Err(CliConfigError::new(
+                "pir mode requires at least two --pir-server entries",
+            ));
+        }
+        let mut servers = Vec::with_capacity(self.pir_servers.len());
+        for entry in &self.pir_servers {
+            let value = entry.trim();
+            if value.is_empty() {
+                return Err(CliConfigError::new(
+                    "--pir-server entries must not be empty",
+                ));
+            }
+            let (label, url) = if let Some((label, url)) = value.split_once('=') {
+                (Some(label.trim().to_string()), url.trim().to_string())
+            } else {
+                (None, value.to_string())
+            };
+            if url.is_empty() {
+                return Err(CliConfigError::new("--pir-server URL is required"));
+            }
+            let label = label.filter(|text| !text.is_empty());
+            servers.push(PirServerConfig { url, label });
+        }
+        Ok(servers)
+    }
+
+    fn parse_pir_dummy_interval(&self) -> Result<Duration, CliConfigError> {
+        match &self.pir_dummy_interval {
+            Some(raw) => parse_duration(raw)
+                .map_err(|err| CliConfigError::new(format!("invalid --pir-dummy-interval: {err}"))),
+            None => Ok(Duration::from_secs(60)),
+        }
+    }
+}
+
 type CliResult<T> = Result<T, Box<dyn Error>>;
+
+#[derive(Debug)]
+struct CliConfigError(String);
+
+impl CliConfigError {
+    fn new(msg: impl Into<String>) -> Self {
+        Self(msg.into())
+    }
+}
+
+impl fmt::Display for CliConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for CliConfigError {}
 
 #[tokio::main]
 async fn main() -> CliResult<()> {
@@ -151,8 +331,8 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
     let network: Network = args.network.into();
     let mnemonic = Mnemonic::<English>::generate(Count::Words24);
     let mnemonic_pass = prompt_secret_confirm(
-        "mnemonic passphrase (leave blank for none): ",
-        "confirm mnemonic passphrase: ",
+        "Mnemonic passphrase (leave blank for none): ",
+        "Confirm mnemonic passphrase: ",
     )?;
     let key_manager =
         KeyManager::from_mnemonic_with_network(mnemonic.phrase(), &mnemonic_pass, network)?;
@@ -176,11 +356,11 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
 
     let wallet_seed = mnemonic_to_wallet_seed(&mnemonic, &mnemonic_pass);
     let enc_pass = prompt_secret_confirm(
-        "wallet encryption password: ",
-        "confirm encryption password: ",
+        "Wallet encryption password: ",
+        "Confirm encryption password: ",
     )?;
     if enc_pass.is_empty() {
-        warn!("using an empty encryption password is not recommended");
+        warn!("Using an empty encryption password is not recommended");
     }
     let encrypted = encrypt_seed(&wallet_seed, &enc_pass).map_err(boxed)?;
 
@@ -197,7 +377,7 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
     println!("{}\n", mnemonic.phrase());
 
     if let Ok(ua) = wallet.default_unified_address() {
-        println!("Unified Address (ZIP-316): {}", ua);
+        println!("Unified Address: {}", ua);
     }
     println!("Warning: RIME is receive-only; you cannot construct or send transactions from this client.");
     let address = wallet.default_address()?;
@@ -211,6 +391,15 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     let mut store = WalletStore::open(&db_path)?;
     let mut wallet = store.load_wallet()?;
     maybe_prompt_orchard_upgrade(&mut store, &mut wallet)?;
+    let mut privacy = args.privacy_config().map_err(boxed)?;
+    let sync_mode = privacy.sync_mode;
+    info!(mode = ?sync_mode, "sync mode selected");
+    if !matches!(
+        sync_mode,
+        SyncMode::Normal | SyncMode::FullMemo | SyncMode::Pir
+    ) {
+        return Err(boxed(io::Error::other("unsupported sync mode")));
+    }
     let mut sapling_tree = if let Some(cp) = store.load_latest_checkpoint(Pool::Sapling)? {
         NoteCommitmentTree::restore(&cp)?
     } else {
@@ -221,14 +410,87 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     } else {
         OrchardNoteCommitmentTree::new()
     };
-    let rpc = Box::new(
-        GrpcRpcClient::connect(RpcConfig {
-            endpoint: args.endpoint.clone(),
-            network: wallet.metadata.network,
-            ..RpcConfig::default()
-        })
-        .await?,
-    );
+    if privacy.tor_only {
+        ensure_not_local_endpoint(&args.endpoint)?;
+        if sync_mode == SyncMode::Pir {
+            ensure_not_local_pir(&privacy)?;
+        }
+    }
+    let tor_state_dir = args
+        .tor_state_dir
+        .clone()
+        .unwrap_or_else(|| default_tor_path(data_dir, "state"));
+    let tor_cache_dir = args
+        .tor_cache_dir
+        .clone()
+        .unwrap_or_else(|| default_tor_path(data_dir, "cache"));
+    if privacy.tor_only {
+        privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
+        privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
+    }
+    let tor_manager = if privacy.tor_only {
+        fs::create_dir_all(&tor_state_dir)?;
+        fs::create_dir_all(&tor_cache_dir)?;
+        let tor_cfg = LiteTorConfig::new(true, tor_state_dir.clone(), tor_cache_dir.clone());
+        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
+        manager
+            .check_connection("check.torproject.org:443")
+            .await
+            .map_err(boxed)?;
+        Some(Arc::new(manager))
+    } else {
+        None
+    };
+    let rpc_client = GrpcRpcClient::connect(RpcConfig {
+        endpoint: args.endpoint.clone(),
+        network: wallet.metadata.network,
+        tor_client: tor_manager.as_ref().map(|m| m.client()),
+        ..RpcConfig::default()
+    })
+    .await?;
+    let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
+    let mut pir_handle: Option<Arc<PirNoteSource>> = None;
+    if sync_mode == SyncMode::FullMemo && privacy.full_memo.is_some() {
+        let latest = rpc.clone().get_latest_block().await?;
+        let latest_height = latest.height as u32;
+        let start_height = wallet
+            .metadata
+            .last_synced_height
+            .saturating_add(1)
+            .max(wallet.metadata.birthday_height);
+        if start_height <= latest_height {
+            let estimate_mb =
+                estimate_full_memo_bandwidth(start_height..latest_height.saturating_add(1));
+            println!(
+                "Full-memo mode: blocks {}-{} (~{:.2} MB estimated)",
+                start_height, latest_height, estimate_mb
+            );
+        }
+    }
+    let grpc_source: Arc<dyn NoteSource> = Arc::new(GrpcNoteSource::new(rpc.clone()));
+    let note_source: Arc<dyn NoteSource> = if sync_mode == SyncMode::Pir {
+        let pir_cfg = privacy
+            .pir
+            .clone()
+            .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
+        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+            .await
+            .map_err(boxed)?;
+        let pir_arc = Arc::new(pir);
+        let mb_per_hour = pir_arc.estimate_bandwidth_per_hour();
+        println!(
+            "PIR scheduler: interval {}s (~{:.1} MB/hour).",
+            pir_cfg.dummy_interval.as_secs().max(1),
+            mb_per_hour
+        );
+        pir_handle = Some(pir_arc.clone());
+        pir_arc
+    } else {
+        grpc_source.clone()
+    };
+    if sync_mode == SyncMode::Pir && !privacy.tor_only {
+        warn!("PIR mode without Tor: PIR servers will see your IP address");
+    }
     let progress = ProgressBar::new(0);
     progress.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] {msg}")
@@ -238,7 +500,7 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     let progress = Arc::new(progress);
     let progress_cb = progress.clone();
     let start = Instant::now();
-    let mut syncer = WalletSyncer::new(wallet, rpc, store)
+    let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
         .with_batch_size(args.batch)
         .with_progress_callback(Arc::new(move |p| {
             progress_cb.set_message(format!(
@@ -265,6 +527,18 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
         result.end_height,
         elapsed
     );
+    if sync_mode == SyncMode::FullMemo {
+        if let Some(stats) = syncer.full_memo_stats() {
+            let downloaded = stats.bytes_downloaded as f64 / 1_000_000_f64;
+            println!(
+                "Full-memo stats: {:.2} MB downloaded, {} transactions fetched, {} memos cached, {} memos retrieved",
+                downloaded, stats.transactions_fetched, stats.memos_cached, stats.memos_retrieved
+            );
+        }
+    }
+    if let Some(pir_source) = pir_handle {
+        show_pir_stats(&pir_source).await;
+    }
     Ok(())
 }
 
@@ -457,8 +731,10 @@ fn init_tracing(data_dir: &Path, verbose: bool) -> CliResult<WorkerGuard> {
 
     let level = if verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let console_layer = fmt::layer().with_writer(std::io::stderr);
-    let file_layer = fmt::layer().with_ansi(false).with_writer(file_writer);
+    let console_layer = tracing_fmt::layer().with_writer(std::io::stderr);
+    let file_layer = tracing_fmt::layer()
+        .with_ansi(false)
+        .with_writer(file_writer);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -479,6 +755,10 @@ fn encode_payment_address(network: Network, addr: &SaplingPaymentAddress) -> Str
 
 fn wallet_db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("wallet.db")
+}
+
+fn default_tor_path(base: &Path, child: &str) -> PathBuf {
+    base.join("tor").join(child)
 }
 
 fn wallet_missing_orchard(wallet: &Wallet) -> bool {
@@ -534,6 +814,25 @@ fn prompt_yes_no(prompt: &str) -> CliResult<bool> {
             }
         };
     }
+}
+
+async fn show_pir_stats(pir_source: &PirNoteSource) {
+    let stats = pir_source.scheduler_stats().await;
+    println!("PIR scheduler statistics:");
+    println!("  Real queries:  {}", stats.real_queries);
+    println!("  Dummy queries: {}", stats.dummy_queries);
+    println!("  Total queries: {}", stats.total_queries);
+    if stats.total_queries > 0 {
+        let ratio = (stats.dummy_queries as f64 / stats.total_queries as f64) * 100.0;
+        println!("  Dummy ratio:  {:.1}%", ratio);
+    } else {
+        println!("  Dummy ratio:  n/a");
+    }
+    println!(
+        "  Approx. bandwidth: {:.1} MB/hour",
+        pir_source.estimate_bandwidth_per_hour()
+    );
+    println!();
 }
 
 enum MigrationStatus {
@@ -615,5 +914,114 @@ fn shorten_address(addr: &str) -> String {
         addr.to_string()
     } else {
         format!("{}...{}", &addr[..12], &addr[addr.len() - 8..])
+    }
+}
+
+fn ensure_not_local_endpoint(endpoint: &str) -> CliResult<()> {
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|e| boxed(io::Error::other(format!("invalid endpoint url: {e}"))))?;
+    if let Some(host) = parsed.host_str() {
+        if is_local_host(host) {
+            return Err(boxed(io::Error::other(
+                "tor-only mode cannot connect to a local endpoint; provide a reachable lightwalletd host without --tor-only or disable tor-only",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_not_local_pir(privacy: &PrivacyConfig) -> CliResult<()> {
+    if let Some(pir) = privacy.pir.as_ref() {
+        for server in &pir.servers {
+            let parsed = reqwest::Url::parse(&server.url).map_err(|e| {
+                boxed(io::Error::other(format!(
+                    "invalid pir server url '{}': {e}",
+                    server.url
+                )))
+            })?;
+            if let Some(host) = parsed.host_str() {
+                if is_local_host(host) {
+                    return Err(boxed(io::Error::other(
+                        "tor-only mode cannot target local pir servers; use reachable hosts or disable tor-only",
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse_sync<I, T>(args: I) -> SyncArgs
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        match Cli::parse_from(args).command {
+            Commands::Sync(args) => args,
+            _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn default_privacy_config_is_normal() {
+        let args = parse_sync(["rime-cli", "sync"]);
+        let cfg = args.privacy_config().expect("config");
+        assert_eq!(cfg.sync_mode, SyncMode::Normal);
+        assert!(!cfg.tor_only);
+    }
+
+    #[test]
+    fn full_memo_respects_no_confirm() {
+        let args = parse_sync(["rime-cli", "sync", "--sync-mode", "full-memo"]);
+        let cfg = args.privacy_config().expect("config");
+        let fm = cfg.full_memo.expect("full memo config");
+        assert!(!fm.require_confirmation);
+    }
+
+    #[test]
+    fn pir_mode_parses_all_fields() {
+        let args = parse_sync([
+            "rime-cli",
+            "sync",
+            "--sync-mode",
+            "pir",
+            "--pir-server",
+            "alpha=https://a",
+            "--pir-server",
+            "https://b",
+            "--pir-dummy-interval",
+            "30s",
+            "--pir-bucket-size",
+            "750",
+        ]);
+        let cfg = args.privacy_config().expect("config");
+        let pir = cfg.pir.expect("pir config");
+        assert_eq!(pir.servers.len(), 2);
+        assert_eq!(pir.servers[0].label.as_deref(), Some("alpha"));
+        assert!(pir.servers[1].label.is_none());
+        assert_eq!(pir.dummy_interval, Duration::from_secs(30));
+        assert_eq!(pir.bucket_size, 750);
+    }
+
+    #[test]
+    fn pir_flags_without_mode_error() {
+        let args = parse_sync([
+            "rime-cli",
+            "sync",
+            "--pir-server",
+            "https://a",
+            "--pir-server",
+            "https://b",
+        ]);
+        assert!(args.privacy_config().is_err());
     }
 }

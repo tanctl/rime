@@ -14,6 +14,14 @@ pub mod db;
 pub use db::RimeWalletDb;
 pub mod sync;
 pub use sync::{SyncError, SyncProgress, SyncResult, WalletSyncer};
+pub mod full_memo;
+pub use full_memo::{estimate_full_memo_bandwidth, FullMemoSyncer, OrchardMemoEntry, SyncStats};
+pub mod source;
+pub use source::{
+    create_pir_source, GrpcNoteSource, MockNoteSource, NoteSource, PirNoteSource, SourceError,
+};
+pub mod tor;
+pub use tor::{TorConfig, TorError, TorManager};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NodeStatus {

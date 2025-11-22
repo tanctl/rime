@@ -1,0 +1,20 @@
+version: '3.8'
+services:
+  pir_server_1:
+    build:
+      context: ../..
+      dockerfile: deploy/pir-server/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data1:/data
+    command: ["pir_server", "serve", "--listen", "0.0.0.0:8080", "--database", "/data/pir.db"]
+  pir_server_2:
+    build:
+      context: ../..
+      dockerfile: deploy/pir-server/Dockerfile
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./data2:/data
+    command: ["pir_server", "serve", "--listen", "0.0.0.0:8080", "--database", "/data/pir.db"]

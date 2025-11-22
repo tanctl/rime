@@ -1,14 +1,19 @@
+use arti_client::TorClient;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use rime_core::Network;
-use std::time::Duration;
+use std::io;
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
-use tracing::{debug, error, info};
 use tokio::time::sleep;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tonic::{
-    transport::{Channel, Endpoint, ClientTlsConfig},
+    transport::{Channel, ClientTlsConfig, Endpoint, Uri},
     Request,
 };
+use tor_rtcompat::PreferredRuntime;
+use tower::service_fn;
+use tracing::{debug, error, info};
 use zcash_primitives::consensus::{BlockHeight, BranchId, MainNetwork, TestNetwork};
 
 trait TlsConfigNative {
@@ -30,16 +35,18 @@ pub mod proto {
 pub use proto::{
     BlockId, BlockRange, ChainSpec, CompactBlock, CompactOrchardAction, CompactSaplingOutput,
     CompactSaplingSpend, CompactTx, Empty, LightdInfo, RawTransaction, SendResponse, TreeState,
+    TxFilter,
 };
 
 use proto::compact_tx_streamer_client::CompactTxStreamerClient;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcConfig {
     pub endpoint: String,
     pub timeout: Duration,
     pub max_retries: u32,
     pub network: Network,
+    pub tor_client: Option<Arc<TorClient<PreferredRuntime>>>,
 }
 
 impl Default for RpcConfig {
@@ -49,6 +56,7 @@ impl Default for RpcConfig {
             timeout: Duration::from_secs(10),
             max_retries: 3,
             network: Network::Testnet,
+            tor_client: None,
         }
     }
 }
@@ -74,6 +82,7 @@ pub trait RpcClient: Send + Sync {
     async fn get_block_range(&self, start: u32, end: u32) -> Result<Vec<CompactBlock>, RpcError>;
     async fn get_tree_state(&self, height: u32) -> Result<TreeState, RpcError>;
     async fn send_transaction(&self, raw_tx: &[u8]) -> Result<String, RpcError>;
+    async fn get_transaction(&self, txid: Vec<u8>) -> Result<RawTransaction, RpcError>;
 }
 
 pub struct GrpcRpcClient {
@@ -87,7 +96,9 @@ impl GrpcRpcClient {
         let base = Endpoint::from_shared(config.endpoint.clone())?
             .timeout(config.timeout)
             .connect_timeout(config.timeout);
-        let channel = if use_plaintext {
+        let channel = if let Some(tor) = config.tor_client.clone() {
+            Self::connect_with_tor(base, use_plaintext, tor).await?
+        } else if use_plaintext {
             base.connect().await?
         } else {
             let tls = ClientTlsConfig::new().with_native_roots();
@@ -107,6 +118,39 @@ impl GrpcRpcClient {
         };
         rpc.validate_chain().await?;
         Ok(rpc)
+    }
+
+    async fn connect_with_tor(
+        mut base: Endpoint,
+        use_plaintext: bool,
+        tor: Arc<TorClient<PreferredRuntime>>,
+    ) -> Result<Channel, RpcError> {
+        if !use_plaintext {
+            let tls = ClientTlsConfig::new().with_native_roots();
+            base = base.tls_config(tls)?;
+        }
+        let connector = service_fn(move |uri: Uri| {
+            let tor = tor.clone();
+            async move {
+                let host = uri
+                    .host()
+                    .ok_or_else(|| io::Error::other("missing host"))?
+                    .to_string();
+                let port = uri
+                    .port_u16()
+                    .unwrap_or(if use_plaintext { 80 } else { 443 });
+                let addr = format!("{host}:{port}");
+                let stream = tor
+                    .connect(&addr)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                let stream = stream.compat();
+                Ok::<_, io::Error>(stream)
+            }
+        });
+        base.connect_with_connector(connector)
+            .await
+            .map_err(RpcError::from)
     }
 
     async fn validate_chain(&self) -> Result<LightdInfo, RpcError> {
@@ -288,6 +332,21 @@ impl RpcClient for GrpcRpcClient {
                         message: error_message,
                     })
                 }
+            })
+        })
+        .await
+    }
+
+    async fn get_transaction(&self, txid: Vec<u8>) -> Result<RawTransaction, RpcError> {
+        self.call_with_retry(|client| {
+            let filter = TxFilter {
+                block: None,
+                index: 0,
+                hash: txid.clone(),
+            };
+            Box::pin(async move {
+                let response = client.get_transaction(Request::new(filter)).await?;
+                Ok(response.into_inner())
             })
         })
         .await

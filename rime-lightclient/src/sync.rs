@@ -1,8 +1,8 @@
-use std::{io::Cursor, sync::Arc};
+use std::{convert::TryFrom, io::Cursor, sync::Arc};
 
-use crate::rpc::{
-    CompactBlock, CompactOrchardAction, CompactSaplingOutput, RpcClient, RpcError, TreeState,
-};
+use crate::full_memo::{FullMemoSyncer, OrchardMemoEntry, SyncStats};
+use crate::rpc::{CompactBlock, CompactOrchardAction, CompactSaplingOutput, TreeState};
+use crate::source::{NoteSource, SourceError};
 use equihash::is_valid_solution;
 use ff::PrimeField;
 use num_bigint::BigUint;
@@ -14,16 +14,19 @@ use orchard::{
     },
     note::{
         ExtractedNoteCommitment as OrchardExtractedNoteCommitment, Note as OrchardNote,
-        Nullifier as OrchardNullifier,
+        Nullifier as OrchardNullifier, TransmittedNoteCiphertext,
     },
     note_encryption::{CompactAction as OrchardCompactAction, OrchardDomain},
+    primitives::redpallas,
     tree::MerkleHashOrchard,
-    Address as OrchardAddress, NOTE_COMMITMENT_TREE_DEPTH as ORCHARD_NOTE_DEPTH,
+    value::ValueCommitment as OrchardValueCommitment,
+    Action as OrchardAction, Address as OrchardAddress,
+    NOTE_COMMITMENT_TREE_DEPTH as ORCHARD_NOTE_DEPTH,
 };
 use rime_core::{
     notes::Pool,
     tree::{NoteCommitmentTree, OrchardNoteCommitmentTree},
-    IncomingViewingKey, Network, Note, NoteId, Wallet, WalletStore,
+    IncomingViewingKey, Network, Note, NoteId, PrivacyConfig, SyncMode, Wallet, WalletStore,
 };
 use sapling::{
     keys::PreparedIncomingViewingKey,
@@ -38,10 +41,15 @@ use thiserror::Error;
 use tracing::warn;
 use zcash_client_backend::proto::service as backend_service;
 use zcash_note_encryption::{
-    try_compact_note_decryption, EphemeralKeyBytes, ShieldedOutput, COMPACT_NOTE_SIZE,
-    ENC_CIPHERTEXT_SIZE,
+    try_compact_note_decryption, try_note_decryption, EphemeralKeyBytes, ShieldedOutput,
+    COMPACT_NOTE_SIZE, ENC_CIPHERTEXT_SIZE,
 };
-use zcash_primitives::{block::BlockHeader, merkle_tree::read_commitment_tree};
+use zcash_primitives::{
+    block::BlockHeader,
+    consensus::{BlockHeight as ZBlockHeight, BranchId, MainNetwork, TestNetwork},
+    merkle_tree::read_commitment_tree,
+    transaction::{Transaction, TxId},
+};
 use zcash_protocol::consensus::Parameters as _;
 
 pub struct TrialDecryptor {
@@ -68,6 +76,7 @@ pub struct OrchardDecryption {
     pub note: OrchardNote,
     pub address: OrchardAddress,
     pub cmx: [u8; 32],
+    pub memo: Option<Vec<u8>>,
 }
 
 pub struct DecryptedNote {
@@ -83,6 +92,8 @@ pub struct DecryptedNote {
     pub zip212: bool,
     pub position: u64,
     pub witness: Vec<u8>,
+    pub txid: Option<TxId>,
+    pub output_index: u32,
 }
 
 impl DecryptedNote {
@@ -189,6 +200,7 @@ impl TrialDecryptor {
     pub fn try_decrypt_orchard_action(
         &self,
         action: &CompactOrchardAction,
+        memo_entry: Option<&OrchardMemoEntry>,
     ) -> Result<Option<OrchardDecryption>, SyncError> {
         let Some(ctx) = &self.orchard else {
             return Ok(None);
@@ -230,15 +242,25 @@ impl TrialDecryptor {
             ciphertext,
         );
         let domain = OrchardDomain::for_compact_action(&compact);
-        Ok(
+        let result =
             try_compact_note_decryption(&domain, &ctx.ivk, &compact).map(|(note, address)| {
                 OrchardDecryption {
                     note,
                     address,
                     cmx: cmx_bytes,
+                    memo: None,
                 }
-            }),
-        )
+            });
+        if let Some(mut decrypted) = result {
+            if let Some(entry) = memo_entry {
+                if let Some(memo) = recover_orchard_memo(&ctx.ivk, entry)? {
+                    decrypted.memo = Some(memo);
+                }
+            }
+            Ok(Some(decrypted))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -271,8 +293,8 @@ fn decomposable_full_ciphertext(cipher: &[u8]) -> bool {
 
 #[derive(Debug, Error)]
 pub enum SyncError {
-    #[error("rpc: {0}")]
-    Rpc(#[from] RpcError),
+    #[error("source: {0}")]
+    Source(#[from] SourceError),
     #[error("chain: {0}")]
     Chain(String),
     #[error("wallet: {0}")]
@@ -287,32 +309,45 @@ type ProgressCallback = Arc<dyn Fn(SyncProgress) + Send + Sync>;
 
 pub struct WalletSyncer {
     wallet: Wallet,
-    rpc: Box<dyn RpcClient>,
+    source: Arc<dyn NoteSource>,
     store: WalletStore,
     decryptor: TrialDecryptor,
     batch_size: u32,
     progress: Option<ProgressCallback>,
     verify_tree_roots: bool,
     verify_headers: bool,
+    privacy: PrivacyConfig,
+    full_memo: Option<FullMemoSyncer>,
 }
 
 impl WalletSyncer {
-    pub fn new(wallet: Wallet, rpc: Box<dyn RpcClient>, store: WalletStore) -> Self {
+    pub fn new(
+        wallet: Wallet,
+        source: Arc<dyn NoteSource>,
+        store: WalletStore,
+        privacy: PrivacyConfig,
+    ) -> Self {
         let orchard_ivk = wallet
             .unified_fvk
             .as_ref()
             .and_then(|ufvk| ufvk.orchard.as_ref())
             .map(|fvk| fvk.to_ivk(OrchardScope::External));
         let decryptor = TrialDecryptor::new(Some(wallet.ivk.clone()), orchard_ivk);
+        let full_memo = match privacy.sync_mode {
+            SyncMode::FullMemo => privacy.full_memo.clone().map(FullMemoSyncer::new),
+            _ => None,
+        };
         Self {
             wallet,
-            rpc,
+            source,
             store,
             decryptor,
             batch_size: 100,
             progress: None,
             verify_tree_roots: true,
             verify_headers: true,
+            privacy,
+            full_memo,
         }
     }
 
@@ -336,6 +371,87 @@ impl WalletSyncer {
         self
     }
 
+    fn full_memo_enabled(&self) -> bool {
+        matches!(self.privacy.sync_mode, SyncMode::FullMemo)
+    }
+
+    pub fn full_memo_stats(&self) -> Option<&SyncStats> {
+        self.full_memo.as_ref().map(|fm| &fm.stats)
+    }
+
+    fn record_memo_hit(&mut self, present: bool) {
+        if present {
+            if let Some(fm) = self.full_memo.as_mut() {
+                fm.record_memo_hit();
+            }
+        }
+    }
+
+    async fn fetch_block_batch(
+        &self,
+        start: u32,
+        end_inclusive: u32,
+    ) -> Result<Vec<CompactBlock>, SourceError> {
+        if start > end_inclusive {
+            return Ok(Vec::new());
+        }
+        let exclusive = end_inclusive.saturating_add(1);
+        let mut blocks = self.source.fetch_compact_blocks(start..exclusive).await?;
+        if exclusive == end_inclusive {
+            // overflow occurred; fetch the last block separately if it exists
+            blocks.push(self.source.fetch_block(end_inclusive).await?);
+        }
+        Ok(blocks)
+    }
+
+    async fn populate_full_memo_for_tx(
+        &mut self,
+        block_height: u32,
+        tx: &crate::rpc::CompactTx,
+    ) -> Result<(), SyncError> {
+        let Some(fm) = self.full_memo.as_mut() else {
+            return Ok(());
+        };
+        if tx.outputs.is_empty() && tx.actions.is_empty() {
+            return Ok(());
+        }
+        let txid = match txid_from_slice(&tx.hash) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        if !fm.mark_fetched(txid) {
+            return Ok(());
+        }
+        let raw = self
+            .source
+            .fetch_transaction(TxId::from_bytes(txid))
+            .await?;
+        fm.stats.transactions_fetched = fm.stats.transactions_fetched.saturating_add(1);
+        fm.stats.bytes_downloaded = fm
+            .stats
+            .bytes_downloaded
+            .saturating_add(raw.data.len() as u64);
+        let branch = branch_id_for_height(self.wallet.metadata.network, block_height)?;
+        let transaction = parse_transaction(&raw.data, branch)?;
+        let sapling_len = transaction
+            .sapling_bundle()
+            .map(|b| b.shielded_outputs().len())
+            .unwrap_or(0);
+        cache_sapling_outputs(fm, txid, &transaction);
+        cache_orchard_actions(fm, txid, &transaction);
+        tracing::debug!(
+            height = block_height,
+            outputs = sapling_len,
+            actions = transaction
+                .orchard_bundle()
+                .map(|b| b.actions().len())
+                .unwrap_or(0),
+            tx = %hex::encode(txid),
+            "Fetched transaction for full-memo caching"
+        );
+        Ok(())
+    }
+
     #[allow(clippy::result_large_err)]
     pub async fn sync_wallet(
         &mut self,
@@ -343,7 +459,7 @@ impl WalletSyncer {
         orchard_tree: &mut OrchardNoteCommitmentTree,
     ) -> Result<SyncResult, SyncError> {
         'resync: loop {
-            let latest = self.rpc.get_latest_block().await?.height as u32;
+            let latest = self.source.latest_height().await?;
             let mut sapling_checkpoint_height =
                 self.wallet.metadata.birthday_height.saturating_sub(1);
             if let Some(cp) = self.store.load_latest_checkpoint(Pool::Sapling)? {
@@ -385,8 +501,18 @@ impl WalletSyncer {
                 return Ok(SyncResult::idle(cursor));
             }
 
+            if self.full_memo_enabled() {
+                tracing::info!(
+                    start = cursor,
+                    end = latest,
+                    "Full-memo mode: downloading all memos for blocks {}-{}",
+                    cursor,
+                    latest
+                );
+            }
+
             let mut prev_block_hash = if cursor > 0 {
-                Some(self.rpc.get_block(cursor - 1).await?.hash)
+                Some(self.source.fetch_block(cursor - 1).await?.hash)
             } else {
                 None
             };
@@ -406,12 +532,30 @@ impl WalletSyncer {
                     .saturating_add(self.batch_size)
                     .saturating_sub(1)
                     .min(latest);
-                let blocks = self.rpc.get_block_range(cursor, end).await?;
+                let blocks = self.fetch_block_batch(cursor, end).await?;
                 if blocks.is_empty() {
                     cursor = end.saturating_add(1);
                     continue;
                 }
-                for block in blocks {
+                for mut block in blocks {
+                    let block_height = block.height as u32;
+                    if self.full_memo_enabled() {
+                        for tx in &block.vtx {
+                            self.populate_full_memo_for_tx(block_height, tx).await?;
+                        }
+                        if let Some(fm) = self.full_memo.as_ref() {
+                            for tx in &mut block.vtx {
+                                if let Ok(txid) = txid_from_slice(&tx.hash) {
+                                    for (idx, output) in tx.outputs.iter_mut().enumerate() {
+                                        fm.hydrate_sapling_output(&txid, idx as u32, output);
+                                    }
+                                    for (idx, action) in tx.actions.iter_mut().enumerate() {
+                                        fm.hydrate_orchard_action(&txid, idx as u32, action);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let header = if self.verify_headers {
                         if block.header.is_empty() {
                             warn!(
@@ -426,8 +570,6 @@ impl WalletSyncer {
                         None
                     };
                     let block_hash = block.hash.clone();
-                    let block_height = block.height as u32;
-
                     if let Some(expected_prev_hash) = &prev_block_hash {
                         if block.prev_hash != *expected_prev_hash {
                             self.handle_reorg(block_height, sapling_tree, orchard_tree)?;
@@ -493,6 +635,9 @@ impl WalletSyncer {
                             notes_found_orchard: summary.notes_found_orchard,
                         });
                     }
+                    if let Some(fm) = self.full_memo.as_mut() {
+                        fm.stats.blocks_scanned = fm.stats.blocks_scanned.saturating_add(1);
+                    }
                 }
                 cursor = end.saturating_add(1);
             }
@@ -513,6 +658,17 @@ impl WalletSyncer {
             self.wallet.metadata.last_synced_height = summary.end_height;
             self.store
                 .update_last_synced_height(self.wallet.metadata.last_synced_height)?;
+            if self.full_memo_enabled() {
+                if let Some(stats) = self.full_memo_stats() {
+                    tracing::info!(
+                        blocks = stats.blocks_scanned,
+                        transactions = stats.transactions_fetched,
+                        memos = stats.memos_cached,
+                        bytes = stats.bytes_downloaded,
+                        "Full-memo sync complete"
+                    );
+                }
+            }
             return Ok(summary);
         }
     }
@@ -541,7 +697,7 @@ impl WalletSyncer {
                 .saturating_add(self.batch_size)
                 .saturating_sub(1)
                 .min(target);
-            let blocks = self.rpc.get_block_range(cursor, end).await?;
+            let blocks = self.fetch_block_batch(cursor, end).await?;
             if blocks.is_empty() {
                 cursor = end.saturating_add(1);
                 continue;
@@ -579,7 +735,11 @@ impl WalletSyncer {
         enforcement: Zip212Enforcement,
     ) -> Result<(), SyncError> {
         for tx in &block.vtx {
-            for output in &tx.outputs {
+            let txid = match txid_from_slice(&tx.hash) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            for (output_index, output) in tx.outputs.iter().enumerate() {
                 let cmu_bytes: [u8; 32] = output
                     .cmu
                     .as_slice()
@@ -590,21 +750,40 @@ impl WalletSyncer {
                     .decryptor
                     .try_decrypt_sapling_output(output, enforcement)?
                 {
-                    let decrypted =
-                        self.build_sapling_note(sapling_tree, block_height, position, found)?;
+                    let decrypted = self.build_sapling_note(
+                        sapling_tree,
+                        block_height,
+                        position,
+                        found,
+                        txid,
+                        output_index as u32,
+                    )?;
                     self.persist_note(decrypted, summary)?;
                 }
             }
-            for action in &tx.actions {
+            for (action_index, action) in tx.actions.iter().enumerate() {
                 let cmx_bytes: [u8; 32] = action
                     .cmx
                     .as_slice()
                     .try_into()
                     .map_err(|_| SyncError::Tree("invalid orchard commitment length".into()))?;
                 let position = orchard_tree.append(cmx_bytes)?;
-                if let Some(found) = self.decryptor.try_decrypt_orchard_action(action)? {
-                    let decrypted =
-                        self.build_orchard_note(orchard_tree, block_height, position, found)?;
+                let memo_entry = self
+                    .full_memo
+                    .as_ref()
+                    .and_then(|fm| fm.orchard_entry(&txid, action_index as u32));
+                if let Some(found) = self
+                    .decryptor
+                    .try_decrypt_orchard_action(action, memo_entry)?
+                {
+                    let decrypted = self.build_orchard_note(
+                        orchard_tree,
+                        block_height,
+                        position,
+                        found,
+                        txid,
+                        action_index as u32,
+                    )?;
                     self.persist_note(decrypted, summary)?;
                 }
             }
@@ -675,17 +854,24 @@ impl WalletSyncer {
         *orchard_tree = OrchardNoteCommitmentTree::new();
         self.wallet.metadata.last_synced_height =
             self.wallet.metadata.birthday_height.saturating_sub(1);
+        if let Some(fm) = self.full_memo.as_mut() {
+            fm.reset();
+        }
         Ok(())
     }
 
     #[allow(clippy::result_large_err)]
     fn build_sapling_note(
-        &self,
+        &mut self,
         tree: &mut NoteCommitmentTree,
         block_height: u32,
         position: u64,
         found: SaplingDecryption,
+        txid: [u8; 32],
+        output_index: u32,
     ) -> Result<DecryptedNote, SyncError> {
+        let has_memo = found.memo.is_some();
+        self.record_memo_hit(has_memo);
         let witness = tree.witness_for_position(position)?;
         let nk = self.wallet.fvk.as_inner().fvk.vk.nk;
         let nullifier = found.note.nf(&nk, position).0;
@@ -704,17 +890,23 @@ impl WalletSyncer {
             zip212,
             position,
             witness,
+            txid: Some(TxId::from_bytes(txid)),
+            output_index,
         })
     }
 
     #[allow(clippy::result_large_err)]
     fn build_orchard_note(
-        &self,
+        &mut self,
         tree: &mut OrchardNoteCommitmentTree,
         block_height: u32,
         position: u64,
         found: OrchardDecryption,
+        txid: [u8; 32],
+        action_index: u32,
     ) -> Result<DecryptedNote, SyncError> {
+        let has_memo = found.memo.is_some();
+        self.record_memo_hit(has_memo);
         let witness = tree.witness_for_position(position)?;
         let orchard_fvk = self
             .wallet
@@ -729,7 +921,7 @@ impl WalletSyncer {
             commitment: found.cmx,
             nullifier,
             value: found.note.value().inner(),
-            memo: None,
+            memo: found.memo,
             height: block_height,
             address_bytes,
             address: hex::encode(address_bytes),
@@ -737,6 +929,8 @@ impl WalletSyncer {
             zip212: true,
             position,
             witness,
+            txid: Some(TxId::from_bytes(txid)),
+            output_index: action_index,
         })
     }
 
@@ -752,6 +946,9 @@ impl WalletSyncer {
         match note.pool {
             Pool::Sapling => summary.notes_found_sapling += 1,
             Pool::Orchard => summary.notes_found_orchard += 1,
+        }
+        if let Some(fm) = self.full_memo.as_mut() {
+            fm.stats.notes_found = fm.stats.notes_found.saturating_add(1);
         }
         Ok(())
     }
@@ -774,7 +971,7 @@ impl WalletSyncer {
             }
         }
         // orchard root still comes from server so at least bind it to the validated header hash
-        let tree_state = self.rpc.get_tree_state(height).await?;
+        let tree_state = self.source.fetch_tree_state(height).await?;
         if tree_state.height as u32 != height {
             return Err(SyncError::Tree(format!(
                 "tree state height mismatch (expected {}, got {})",
@@ -1044,27 +1241,115 @@ fn zip212_enforcement(network: Network, height: u32) -> Zip212Enforcement {
     }
 }
 
+fn txid_from_slice(bytes: &[u8]) -> Result<[u8; 32], SyncError> {
+    if bytes.len() != 32 {
+        return Err(SyncError::Chain("txid length mismatch".into()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(bytes);
+    Ok(arr)
+}
+
+fn branch_id_for_height(network: Network, height: u32) -> Result<BranchId, SyncError> {
+    let branch = match network {
+        Network::Mainnet => BranchId::for_height(&MainNetwork, ZBlockHeight::from(height)),
+        Network::Testnet => BranchId::for_height(&TestNetwork, ZBlockHeight::from(height)),
+    };
+    Ok(branch)
+}
+
+fn parse_transaction(data: &[u8], branch: BranchId) -> Result<Transaction, SyncError> {
+    Transaction::read(Cursor::new(data), branch)
+        .map_err(|e| SyncError::Chain(format!("failed to decode transaction: {e}")))
+}
+
+fn cache_sapling_outputs(fm: &mut FullMemoSyncer, txid: [u8; 32], tx: &Transaction) {
+    if let Some(bundle) = tx.sapling_bundle() {
+        for (idx, output) in bundle.shielded_outputs().iter().enumerate() {
+            fm.cache_sapling(txid, idx as u32, output.enc_ciphertext().to_vec());
+        }
+    }
+}
+
+fn cache_orchard_actions(fm: &mut FullMemoSyncer, txid: [u8; 32], tx: &Transaction) {
+    if let Some(bundle) = tx.orchard_bundle() {
+        for (idx, action) in bundle.actions().iter().enumerate() {
+            let encrypted = action.encrypted_note();
+            let rk_bytes: [u8; 32] = action.rk().into();
+            let entry = OrchardMemoEntry {
+                nullifier: action.nullifier().to_bytes(),
+                rk: rk_bytes,
+                cmx: action.cmx().to_bytes(),
+                cv_net: action.cv_net().to_bytes(),
+                epk_bytes: encrypted.epk_bytes,
+                ciphertext: encrypted.enc_ciphertext,
+                out_ciphertext: encrypted.out_ciphertext,
+            };
+            fm.cache_orchard(txid, idx as u32, entry);
+        }
+    }
+}
+
+fn recover_orchard_memo(
+    ivk: &OrchardPreparedIncomingViewingKey,
+    entry: &OrchardMemoEntry,
+) -> Result<Option<Vec<u8>>, SyncError> {
+    let nullifier = OrchardNullifier::from_bytes(&entry.nullifier)
+        .into_option()
+        .ok_or_else(|| SyncError::Chain("invalid orchard nullifier".into()))?;
+    let rk = redpallas::VerificationKey::try_from(entry.rk)
+        .map_err(|_| SyncError::Chain("invalid orchard rk".into()))?;
+    let cmx = OrchardExtractedNoteCommitment::from_bytes(&entry.cmx)
+        .into_option()
+        .ok_or_else(|| SyncError::Chain("invalid orchard cmx".into()))?;
+    let cv_net = OrchardValueCommitment::from_bytes(&entry.cv_net)
+        .into_option()
+        .ok_or_else(|| SyncError::Chain("invalid orchard cv_net".into()))?;
+    let ciphertext = TransmittedNoteCiphertext {
+        epk_bytes: entry.epk_bytes,
+        enc_ciphertext: entry.ciphertext,
+        out_ciphertext: entry.out_ciphertext,
+    };
+    let action = OrchardAction::from_parts(nullifier, rk, cmx, ciphertext, cv_net, ());
+    let domain = OrchardDomain::for_action(&action);
+    Ok(try_note_decryption(&domain, ivk, &action).map(|(_, _, memo)| memo.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{CompactSaplingSpend, CompactTx, TreeState};
+    use crate::rpc::{CompactSaplingSpend, CompactTx, RawTransaction, TreeState};
+    use crate::source::{MockNoteSource, NoteSource};
+    use async_trait::async_trait;
     use ff::PrimeField;
     use jubjub::Fr;
     use rand::{rngs::StdRng, SeedableRng};
-    use sapling::bundle::OutputDescription;
+    use redjubjub::Signature;
+    use rime_core::FullMemoConfig;
+    use sapling::bundle::{
+        Authorized as SapAuthorized, Bundle, GrothProofBytes, OutputDescription,
+    };
     use sapling::note_encryption::Zip212Enforcement;
     use sapling::{
         keys::OutgoingViewingKey,
         note::Rseed,
         note_encryption::{sapling_note_encryption, SaplingDomain},
-        value::NoteValue,
+        value::{NoteValue, ValueCommitTrapdoor},
         PaymentAddress,
     };
     use sapling::{keys::SaplingIvk, value::ValueCommitment};
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::collections::HashMap;
+    use std::ops::Range;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex,
+    };
     use zcash_note_encryption::{Domain, EphemeralKeyBytes};
+    use zcash_primitives::consensus::BranchId;
+    use zcash_primitives::transaction::{TransactionData, TxId, TxVersion};
     use zcash_protocol::consensus::BlockHeight;
+    use zcash_protocol::value::ZatBalance;
 
     fn heartwood_mainnet() -> u32 {
         zcash_protocol::consensus::MAIN_NETWORK
@@ -1073,202 +1358,97 @@ mod tests {
             .expect("mainnet activation height available")
     }
 
-    struct MockRpcClient {
-        block: CompactBlock,
-    }
-
-    struct SequenceRpcClient {
-        blocks: Vec<CompactBlock>,
-    }
-
-    struct ReorgRpcClient {
+    struct ReorgNoteSource {
         first: Vec<CompactBlock>,
         second: Vec<CompactBlock>,
         use_second: Mutex<bool>,
+        latest: u32,
     }
 
-    #[async_trait::async_trait]
-    impl RpcClient for MockRpcClient {
-        async fn get_latest_block(&self) -> Result<crate::rpc::BlockId, RpcError> {
-            Ok(crate::rpc::BlockId {
-                height: self.block.height,
-                hash: Vec::new(),
-            })
-        }
-
-        async fn get_block(&self, _height: u32) -> Result<CompactBlock, RpcError> {
-            Ok(self.block.clone())
-        }
-
-        async fn get_block_range(
-            &self,
-            start: u32,
-            end: u32,
-        ) -> Result<Vec<CompactBlock>, RpcError> {
-            if start <= self.block.height as u32 && end >= self.block.height as u32 {
-                Ok(vec![self.block.clone()])
-            } else {
-                Ok(Vec::new())
+    impl ReorgNoteSource {
+        fn new(first: Vec<CompactBlock>, second: Vec<CompactBlock>) -> Self {
+            let latest = first
+                .iter()
+                .chain(second.iter())
+                .map(|block| block.height as u32)
+                .max()
+                .unwrap_or(0);
+            Self {
+                first,
+                second,
+                use_second: Mutex::new(false),
+                latest,
             }
         }
 
-        async fn get_tree_state(&self, _height: u32) -> Result<TreeState, RpcError> {
-            Ok(TreeState {
-                network: "main".into(),
-                height: 0,
-                hash: String::new(),
-                time: 0,
-                sapling_tree: String::new(),
-                orchard_tree: String::new(),
-            })
-        }
-
-        async fn send_transaction(&self, _raw_tx: &[u8]) -> Result<String, RpcError> {
-            Ok(String::new())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl RpcClient for SequenceRpcClient {
-        async fn get_latest_block(&self) -> Result<crate::rpc::BlockId, RpcError> {
-            let Some(last) = self.blocks.last() else {
-                return Err(RpcError::InvalidResponse("no blocks"));
-            };
-            Ok(crate::rpc::BlockId {
-                height: last.height,
-                hash: last.hash.clone(),
-            })
-        }
-
-        async fn get_block(&self, height: u32) -> Result<CompactBlock, RpcError> {
-            if let Some(block) = self
-                .blocks
-                .iter()
-                .find(|block| block.height == height as u64)
-                .cloned()
-            {
-                Ok(block)
+        fn dataset(&self, second: bool) -> &Vec<CompactBlock> {
+            if second {
+                &self.second
             } else {
-                self.blocks
-                    .first()
-                    .cloned()
-                    .ok_or(RpcError::InvalidResponse("missing block"))
+                &self.first
             }
         }
-
-        async fn get_block_range(
-            &self,
-            start: u32,
-            end: u32,
-        ) -> Result<Vec<CompactBlock>, RpcError> {
-            Ok(self
-                .blocks
-                .iter()
-                .filter(|block| {
-                    let height = block.height as u32;
-                    height >= start && height <= end
-                })
-                .cloned()
-                .collect())
-        }
-
-        async fn get_tree_state(&self, _height: u32) -> Result<TreeState, RpcError> {
-            Ok(TreeState {
-                network: "main".into(),
-                height: 0,
-                hash: String::new(),
-                time: 0,
-                sapling_tree: String::new(),
-                orchard_tree: String::new(),
-            })
-        }
-
-        async fn send_transaction(&self, _raw_tx: &[u8]) -> Result<String, RpcError> {
-            Ok(String::new())
-        }
     }
 
-    #[async_trait::async_trait]
-    impl RpcClient for ReorgRpcClient {
-        async fn get_latest_block(&self) -> Result<crate::rpc::BlockId, RpcError> {
-            let use_second = *self.use_second.lock().unwrap();
-            let chain = if use_second {
-                &self.second
-            } else {
-                &self.first
-            };
-            let Some(last) = chain.last() else {
-                return Err(RpcError::InvalidResponse("no blocks"));
-            };
-            Ok(crate::rpc::BlockId {
-                height: last.height,
-                hash: last.hash.clone(),
-            })
-        }
-
-        async fn get_block(&self, height: u32) -> Result<CompactBlock, RpcError> {
-            let use_second = *self.use_second.lock().unwrap();
-            let chain = if use_second {
-                &self.second
-            } else {
-                &self.first
-            };
-            chain
-                .iter()
-                .find(|block| block.height == height as u64)
-                .cloned()
-                .ok_or(RpcError::InvalidResponse("missing block"))
-        }
-
-        async fn get_block_range(
+    #[async_trait]
+    impl NoteSource for ReorgNoteSource {
+        async fn fetch_compact_blocks(
             &self,
-            start: u32,
-            end: u32,
-        ) -> Result<Vec<CompactBlock>, RpcError> {
-            let mut use_second = self.use_second.lock().unwrap();
-            let chain = if *use_second {
-                &self.second
-            } else {
-                &self.first
-            };
-            let blocks = chain
+            range: Range<u32>,
+        ) -> Result<Vec<CompactBlock>, SourceError> {
+            if range.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut flag = self.use_second.lock().unwrap();
+            let data = self.dataset(*flag);
+            let blocks = data
                 .iter()
                 .filter(|block| {
-                    let height = block.height as u32;
-                    height >= start && height <= end
+                    let h = block.height as u32;
+                    h >= range.start && h < range.end
                 })
                 .cloned()
-                .collect();
-            if !*use_second {
-                *use_second = true;
+                .collect::<Vec<_>>();
+            if !*flag {
+                *flag = true;
             }
             Ok(blocks)
         }
 
-        async fn get_tree_state(&self, _height: u32) -> Result<TreeState, RpcError> {
+        async fn fetch_block(&self, height: u32) -> Result<CompactBlock, SourceError> {
+            let flag = self.use_second.lock().unwrap();
+            self.dataset(*flag)
+                .iter()
+                .find(|block| block.height as u32 == height)
+                .cloned()
+                .ok_or_else(|| SourceError::NotFound(format!("block height {height} missing")))
+        }
+
+        async fn fetch_tree_state(&self, height: u32) -> Result<TreeState, SourceError> {
             Ok(TreeState {
-                network: "main".into(),
-                height: 0,
-                hash: String::new(),
-                time: 0,
-                sapling_tree: String::new(),
-                orchard_tree: String::new(),
+                height: height as u64,
+                ..TreeState::default()
             })
         }
 
-        async fn send_transaction(&self, _raw_tx: &[u8]) -> Result<String, RpcError> {
-            Ok(String::new())
+        async fn fetch_transaction(&self, _txid: TxId) -> Result<RawTransaction, SourceError> {
+            Err(SourceError::NotFound(
+                "mock source has no transactions".into(),
+            ))
         }
+
+        async fn latest_height(&self) -> Result<u32, SourceError> {
+            Ok(self.latest)
+        }
+    }
+    fn sample_phrase() -> &'static str {
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
     }
 
     fn sample_wallet() -> Wallet {
         use rime_core::{keys::KeyManager, Network};
-        let km = KeyManager::from_mnemonic_with_network(
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art",
-            "",
-            Network::Mainnet,
-        )
-        .unwrap();
+        let km =
+            KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Mainnet).unwrap();
         let sk = km.sapling_spending_key().unwrap();
         Wallet::new(
             rime_core::WalletMetadata {
@@ -1281,6 +1461,49 @@ mod tests {
             km.ivk().unwrap(),
             None,
         )
+    }
+
+    fn sample_wallet_at(height: u32) -> Wallet {
+        let mut wallet = sample_wallet();
+        wallet.metadata.birthday_height = height;
+        wallet.metadata.last_synced_height = height.saturating_sub(1);
+        wallet
+    }
+
+    fn synthetic_hash(seed: u64) -> Vec<u8> {
+        let mut out = [0u8; 32];
+        for (i, chunk) in out.chunks_mut(8).enumerate() {
+            let value = seed.wrapping_add(i as u64);
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        out.to_vec()
+    }
+
+    fn block_hash(height: u32) -> Vec<u8> {
+        synthetic_hash(0xB000_0000_0000_0000u64 | height as u64)
+    }
+
+    fn tx_hash(height: u32, index: u32) -> Vec<u8> {
+        let seed = ((height as u64) << 32) | index as u64;
+        synthetic_hash(0x7000_0000_0000_0000u64 | seed)
+    }
+
+    fn dummy_block(height: u32) -> CompactBlock {
+        let prev = if height == 0 {
+            vec![0u8; 32]
+        } else {
+            block_hash(height.saturating_sub(1))
+        };
+        CompactBlock {
+            proto_version: 0,
+            height: height as u64,
+            hash: block_hash(height),
+            prev_hash: prev,
+            time: 0,
+            header: Vec::new(),
+            vtx: Vec::new(),
+            chain_metadata: None,
+        }
     }
 
     fn build_compact_output(pa: &PaymentAddress) -> CompactSaplingOutput {
@@ -1328,7 +1551,7 @@ mod tests {
 
     #[tokio::test]
     async fn trial_decryption_round_trip() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
         let decryptor = TrialDecryptor::new(Some(wallet.ivk.clone()), None);
@@ -1340,7 +1563,7 @@ mod tests {
 
     #[tokio::test]
     async fn trial_decryption_recovers_memo_with_full_ciphertext() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let memo_bytes = [0x42u8; 512];
         let output = build_full_output(&pa, memo_bytes);
@@ -1353,9 +1576,171 @@ mod tests {
         assert_eq!(memo, memo_bytes.to_vec());
     }
 
+    fn memo_bytes(text: &str) -> [u8; 512] {
+        let mut buf = [0u8; 512];
+        let bytes = text.as_bytes();
+        let len = bytes.len().min(512);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        buf
+    }
+
+    fn sapling_output_entry(
+        addr: &PaymentAddress,
+        memo: [u8; 512],
+        seed: u64,
+    ) -> (CompactSaplingOutput, OutputDescription<GrothProofBytes>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let value = NoteValue::from_raw(5 + seed);
+        let note = addr.create_note(value, Rseed::AfterZip212([seed as u8; 32]));
+        let cmu = note.cmu();
+        let encryptor =
+            sapling_note_encryption(Some(OutgoingViewingKey([0; 32])), note, memo, &mut rng);
+        let enc_cipher = encryptor.encrypt_note_plaintext();
+        let mut compact_cipher = [0u8; COMPACT_NOTE_SIZE];
+        compact_cipher.copy_from_slice(&enc_cipher[..COMPACT_NOTE_SIZE]);
+        let epk_bytes = SaplingDomain::epk_bytes(encryptor.epk());
+        let rcv = ValueCommitTrapdoor::random(&mut rng);
+        let cv = ValueCommitment::derive(value, rcv);
+        let mut rng_out = StdRng::seed_from_u64(seed + 100);
+        let out_cipher = encryptor.encrypt_outgoing_plaintext(&cv, &cmu, &mut rng_out);
+        let compact = CompactSaplingOutput {
+            cmu: cmu.to_bytes().to_vec(),
+            ephemeral_key: epk_bytes.as_ref().to_vec(),
+            ciphertext: compact_cipher.to_vec(),
+        };
+        let proof: GrothProofBytes = [0u8; 192];
+        let full = OutputDescription::from_parts(cv, cmu, epk_bytes, enc_cipher, out_cipher, proof);
+        (compact, full)
+    }
+
+    fn build_sapling_transaction(
+        outputs: &[(PaymentAddress, [u8; 512])],
+    ) -> (CompactTx, Vec<u8>, TxId) {
+        let mut compact_outputs = Vec::new();
+        let mut full_outputs = Vec::new();
+        for (idx, (addr, memo)) in outputs.iter().enumerate() {
+            let seed = (idx as u64) + 1;
+            let (compact, full) = sapling_output_entry(addr, *memo, seed);
+            compact_outputs.push(compact);
+            full_outputs.push(full);
+        }
+        let bundle = Bundle::from_parts(
+            Vec::new(),
+            full_outputs,
+            ZatBalance::zero(),
+            SapAuthorized {
+                binding_sig: Signature::from([0u8; 64]),
+            },
+        )
+        .expect("non-empty bundle");
+        let tx_data = TransactionData::from_parts(
+            TxVersion::V5,
+            BranchId::Nu5,
+            0,
+            ZBlockHeight::from(0),
+            None,
+            None,
+            Some(bundle),
+            None,
+        );
+        let tx = tx_data.freeze().expect("transaction");
+        let mut raw = Vec::new();
+        tx.write(&mut raw).expect("serialize transaction");
+        let txid = tx.txid();
+        let compact_tx = CompactTx {
+            index: 0,
+            hash: txid.as_ref().to_vec(),
+            fee: 0,
+            spends: Vec::new(),
+            outputs: compact_outputs,
+            actions: Vec::new(),
+        };
+        (compact_tx, raw, txid)
+    }
+
+    fn build_counting_source(
+        blocks: Vec<CompactBlock>,
+        transactions: HashMap<TxId, RawTransaction>,
+    ) -> (Arc<dyn NoteSource>, Arc<AtomicU32>) {
+        CountingSource::new(blocks, transactions)
+    }
+
+    struct CountingSource {
+        latest_height: u32,
+        blocks: HashMap<u32, CompactBlock>,
+        transactions: HashMap<TxId, RawTransaction>,
+        fetches: Arc<AtomicU32>,
+    }
+
+    impl CountingSource {
+        #[allow(clippy::new_ret_no_self)]
+        fn new(
+            blocks: Vec<CompactBlock>,
+            transactions: HashMap<TxId, RawTransaction>,
+        ) -> (Arc<dyn NoteSource>, Arc<AtomicU32>) {
+            let latest = blocks.iter().map(|b| b.height as u32).max().unwrap_or(0);
+            let map = blocks
+                .into_iter()
+                .map(|b| (b.height as u32, b))
+                .collect::<HashMap<_, _>>();
+            let counter = Arc::new(AtomicU32::new(0));
+            let source = Arc::new(CountingSource {
+                latest_height: latest,
+                blocks: map,
+                transactions,
+                fetches: counter.clone(),
+            });
+            (source, counter)
+        }
+    }
+
+    #[async_trait]
+    impl NoteSource for CountingSource {
+        async fn fetch_compact_blocks(
+            &self,
+            range: Range<u32>,
+        ) -> Result<Vec<CompactBlock>, SourceError> {
+            let mut blocks = Vec::new();
+            for height in range {
+                if let Some(block) = self.blocks.get(&height) {
+                    blocks.push(block.clone());
+                }
+            }
+            Ok(blocks)
+        }
+
+        async fn fetch_block(&self, height: u32) -> Result<CompactBlock, SourceError> {
+            Ok(self
+                .blocks
+                .get(&height)
+                .cloned()
+                .unwrap_or_else(|| CompactBlock {
+                    proto_version: 0,
+                    height: height as u64,
+                    ..CompactBlock::default()
+                }))
+        }
+
+        async fn fetch_tree_state(&self, _height: u32) -> Result<TreeState, SourceError> {
+            Err(SourceError::NotFound("tree state unavailable".into()))
+        }
+
+        async fn fetch_transaction(&self, txid: TxId) -> Result<RawTransaction, SourceError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.transactions
+                .get(&txid)
+                .cloned()
+                .ok_or_else(|| SourceError::NotFound("transaction not found".into()))
+        }
+
+        async fn latest_height(&self) -> Result<u32, SourceError> {
+            Ok(self.latest_height)
+        }
+    }
+
     #[tokio::test]
     async fn trial_decryption_computes_nullifier_deterministically() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
         let decryptor = TrialDecryptor::new(Some(wallet.ivk.clone()), None);
@@ -1367,33 +1752,22 @@ mod tests {
         let position = tree
             .append(output.cmu.as_slice().try_into().expect("commitment bytes"))
             .unwrap();
-        let rpc: Box<dyn RpcClient> = Box::new(MockRpcClient {
-            block: CompactBlock {
-                proto_version: 0,
-                height: 0,
-                hash: Vec::new(),
-                prev_hash: Vec::new(),
-                time: 0,
-                header: Vec::new(),
-                vtx: Vec::new(),
-                chain_metadata: None,
-            },
-        });
         let store = WalletStore::in_memory().unwrap();
-        let syncer = WalletSyncer::new(wallet, rpc, store);
+        let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::new());
+        let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default());
         let direct_nf = found
             .note
             .nf(&syncer.wallet.fvk.as_inner().fvk.vk.nk, position)
             .0;
         let decrypted = syncer
-            .build_sapling_note(&mut tree, 5, position, found)
+            .build_sapling_note(&mut tree, 5, position, found, [0u8; 32], 0)
             .expect("build note");
         assert_eq!(decrypted.nullifier, direct_nf);
     }
 
     #[tokio::test]
     async fn trial_decryption_known_vector() {
-        // load first Sapling note-encryption vector (ZIP 212 off) from vendored file
+        // load first sapling note-encryption vector (ZIP 212 off) from vendored file
         let text = include_str!("../test_vectors/sapling_note_encryption.json");
         let data: Value = serde_json::from_str(text).expect("json");
         let rows = data.as_array().expect("array");
@@ -1477,12 +1851,13 @@ mod tests {
 
     #[tokio::test]
     async fn sync_discovers_note_and_updates_height() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
+        let block_height = heartwood_mainnet();
         let tx = CompactTx {
             index: 0,
-            hash: Vec::new(),
+            hash: tx_hash(block_height, 0),
             fee: 0,
             spends: vec![CompactSaplingSpend { nf: vec![0u8; 32] }],
             outputs: vec![output],
@@ -1490,18 +1865,19 @@ mod tests {
         };
         let block = CompactBlock {
             proto_version: 0,
-            height: heartwood_mainnet() as u64,
-            hash: Vec::new(),
-            prev_hash: Vec::new(),
+            height: block_height as u64,
+            hash: block_hash(block_height),
+            prev_hash: block_hash(block_height.saturating_sub(1)),
             time: 0,
             header: Vec::new(),
             vtx: vec![tx],
             chain_metadata: None,
         };
 
-        let rpc: Box<dyn RpcClient> = Box::new(MockRpcClient { block });
+        let prev = dummy_block(block.height as u32 - 1);
+        let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::from_blocks(vec![prev, block]));
         let store = WalletStore::in_memory().unwrap();
-        let mut syncer = WalletSyncer::new(wallet, rpc, store)
+        let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default())
             .with_tree_verification(false)
             .with_header_validation(false);
         let mut sapling_tree = NoteCommitmentTree::new();
@@ -1518,7 +1894,7 @@ mod tests {
 
     #[tokio::test]
     async fn spent_notes_are_marked_after_matching_nullifier() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
         let decryptor = TrialDecryptor::new(Some(wallet.ivk.clone()), None);
@@ -1540,7 +1916,7 @@ mod tests {
 
         let receive_tx = CompactTx {
             index: 0,
-            hash: Vec::new(),
+            hash: tx_hash(heartwood_mainnet(), 0),
             fee: 0,
             spends: Vec::new(),
             outputs: vec![output.clone()],
@@ -1548,7 +1924,7 @@ mod tests {
         };
         let spend_tx = CompactTx {
             index: 1,
-            hash: Vec::new(),
+            hash: tx_hash(heartwood_mainnet().saturating_add(1), 1),
             fee: 0,
             spends: vec![CompactSaplingSpend {
                 nf: nullifier.to_vec(),
@@ -1557,11 +1933,12 @@ mod tests {
             actions: Vec::new(),
         };
         let blocks = vec![
+            dummy_block(heartwood_mainnet().saturating_sub(1)),
             CompactBlock {
                 proto_version: 0,
                 height: heartwood_mainnet() as u64,
-                hash: Vec::new(),
-                prev_hash: Vec::new(),
+                hash: block_hash(heartwood_mainnet()),
+                prev_hash: block_hash(heartwood_mainnet().saturating_sub(1)),
                 time: 0,
                 header: Vec::new(),
                 vtx: vec![receive_tx],
@@ -1570,8 +1947,8 @@ mod tests {
             CompactBlock {
                 proto_version: 0,
                 height: (heartwood_mainnet() + 1) as u64,
-                hash: Vec::new(),
-                prev_hash: Vec::new(),
+                hash: block_hash(heartwood_mainnet().saturating_add(1)),
+                prev_hash: block_hash(heartwood_mainnet()),
                 time: 0,
                 header: Vec::new(),
                 vtx: vec![spend_tx],
@@ -1579,9 +1956,9 @@ mod tests {
             },
         ];
 
-        let rpc: Box<dyn RpcClient> = Box::new(SequenceRpcClient { blocks });
+        let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::from_blocks(blocks));
         let store = WalletStore::in_memory().unwrap();
-        let mut syncer = WalletSyncer::new(wallet, rpc, store)
+        let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default())
             .with_tree_verification(false)
             .with_header_validation(false);
         let mut sapling_tree = NoteCommitmentTree::new();
@@ -1597,23 +1974,24 @@ mod tests {
 
     #[tokio::test]
     async fn reorg_resets_state_and_rescans() {
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
         let tx_good = CompactTx {
             index: 0,
-            hash: Vec::new(),
+            hash: tx_hash(heartwood_mainnet().saturating_add(1), 0),
             fee: 0,
             spends: Vec::new(),
             outputs: vec![output],
             actions: Vec::new(),
         };
+        let prev = dummy_block(heartwood_mainnet().saturating_sub(1));
 
         let block0 = CompactBlock {
             proto_version: 0,
             height: heartwood_mainnet() as u64,
             hash: vec![0x11; 32],
-            prev_hash: Vec::new(),
+            prev_hash: prev.hash.clone(),
             time: 0,
             header: Vec::new(),
             vtx: Vec::new(),
@@ -1640,13 +2018,11 @@ mod tests {
             chain_metadata: None,
         };
 
-        let rpc: Box<dyn RpcClient> = Box::new(ReorgRpcClient {
-            first: vec![block0.clone(), bad_block],
-            second: vec![block0, good_block],
-            use_second: Mutex::new(false),
-        });
+        let first_chain = vec![prev.clone(), block0.clone(), bad_block];
+        let second_chain = vec![prev, block0, good_block];
+        let source: Arc<dyn NoteSource> = Arc::new(ReorgNoteSource::new(first_chain, second_chain));
         let store = WalletStore::in_memory().unwrap();
-        let mut syncer = WalletSyncer::new(wallet, rpc, store)
+        let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default())
             .with_tree_verification(false)
             .with_header_validation(false);
         let mut sapling_tree = NoteCommitmentTree::new();
@@ -1665,14 +2041,15 @@ mod tests {
     async fn offline_reorg_detected_via_cached_hash() {
         use tempfile::tempdir;
 
-        let wallet = sample_wallet();
+        let wallet = sample_wallet_at(heartwood_mainnet());
         let pa = wallet.default_address().unwrap();
         let good_output = build_compact_output(&pa);
+        let prev_anchor = dummy_block(heartwood_mainnet().saturating_sub(1));
         let block0 = CompactBlock {
             proto_version: 0,
             height: heartwood_mainnet() as u64,
             hash: vec![0x10; 32],
-            prev_hash: Vec::new(),
+            prev_hash: prev_anchor.hash.clone(),
             time: 0,
             header: Vec::new(),
             vtx: Vec::new(),
@@ -1687,7 +2064,7 @@ mod tests {
             header: Vec::new(),
             vtx: vec![CompactTx {
                 index: 0,
-                hash: Vec::new(),
+                hash: tx_hash(heartwood_mainnet().saturating_add(1), 0),
                 fee: 0,
                 spends: Vec::new(),
                 outputs: vec![good_output],
@@ -1718,10 +2095,12 @@ mod tests {
         {
             let store = WalletStore::open(&db_path).unwrap();
             let wallet = store.load_wallet().unwrap();
-            let rpc: Box<dyn RpcClient> = Box::new(SequenceRpcClient {
-                blocks: vec![block0.clone(), block_good.clone()],
-            });
-            let mut syncer = WalletSyncer::new(wallet, rpc, store)
+            let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::from_blocks(vec![
+                prev_anchor.clone(),
+                block0.clone(),
+                block_good.clone(),
+            ]));
+            let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default())
                 .with_tree_verification(false)
                 .with_header_validation(false);
             let mut sapling_tree = NoteCommitmentTree::new();
@@ -1735,10 +2114,12 @@ mod tests {
 
         let store = WalletStore::open(&db_path).unwrap();
         let wallet = store.load_wallet().unwrap();
-        let rpc: Box<dyn RpcClient> = Box::new(SequenceRpcClient {
-            blocks: vec![block0, block_reorg],
-        });
-        let mut syncer = WalletSyncer::new(wallet, rpc, store)
+        let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::from_blocks(vec![
+            prev_anchor,
+            block0,
+            block_reorg,
+        ]));
+        let mut syncer = WalletSyncer::new(wallet, source, store, PrivacyConfig::default())
             .with_tree_verification(false)
             .with_header_validation(false);
         let mut sapling_tree = NoteCommitmentTree::new();
@@ -1756,23 +2137,23 @@ mod tests {
     async fn checkpoint_is_created_and_loaded() {
         use tempfile::tempdir;
 
-        let wallet = sample_wallet();
+        let checkpoint_height = heartwood_mainnet() + 1000;
+        let wallet = sample_wallet_at(checkpoint_height);
         let pa = wallet.default_address().unwrap();
         let output = build_compact_output(&pa);
         let tx = CompactTx {
             index: 0,
-            hash: Vec::new(),
+            hash: tx_hash(checkpoint_height, 0),
             fee: 0,
             spends: vec![CompactSaplingSpend { nf: vec![0u8; 32] }],
             outputs: vec![output],
             actions: Vec::new(),
         };
-        let checkpoint_height = heartwood_mainnet() + 1000;
         let block = CompactBlock {
             proto_version: 0,
             height: checkpoint_height as u64,
-            hash: Vec::new(),
-            prev_hash: Vec::new(),
+            hash: block_hash(checkpoint_height),
+            prev_hash: block_hash(checkpoint_height.saturating_sub(1)),
             time: 0,
             header: Vec::new(),
             vtx: vec![tx],
@@ -1782,9 +2163,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("wallet.db");
         {
-            let rpc: Box<dyn RpcClient> = Box::new(MockRpcClient {
-                block: block.clone(),
-            });
+            let prev = dummy_block(checkpoint_height.saturating_sub(1));
+            let source: Arc<dyn NoteSource> =
+                Arc::new(MockNoteSource::from_blocks(vec![prev, block.clone()]));
             let store = WalletStore::open(&db_path).unwrap();
             let mut syncer = WalletSyncer::new(
                 Wallet {
@@ -1793,8 +2174,9 @@ mod tests {
                     ivk: wallet.ivk.clone(),
                     unified_fvk: wallet.unified_fvk.clone(),
                 },
-                rpc,
+                source,
                 store,
+                PrivacyConfig::default(),
             )
             .with_tree_verification(false)
             .with_header_validation(false);
@@ -1815,7 +2197,8 @@ mod tests {
             assert_eq!(checkpoint.root, root);
         }
 
-        let rpc: Box<dyn RpcClient> = Box::new(MockRpcClient { block });
+        let prev = dummy_block(checkpoint_height.saturating_sub(1));
+        let source: Arc<dyn NoteSource> = Arc::new(MockNoteSource::from_blocks(vec![prev, block]));
         let store = WalletStore::open(&db_path).unwrap();
         let mut syncer = WalletSyncer::new(
             Wallet {
@@ -1829,8 +2212,9 @@ mod tests {
                 ivk: wallet.ivk,
                 unified_fvk: None,
             },
-            rpc,
+            source,
             store,
+            PrivacyConfig::default(),
         )
         .with_tree_verification(false)
         .with_header_validation(false);
@@ -1856,5 +2240,125 @@ mod tests {
         };
         let chain_state = convert_tree_state(&tree).expect("convert tree state");
         assert_eq!(chain_state.block_height(), BlockHeight::from(0));
+    }
+
+    #[tokio::test]
+    async fn full_memo_downloads_all_memos() {
+        let height = heartwood_mainnet() + 5;
+        let wallet_normal = sample_wallet_at(height);
+        let wallet_full = sample_wallet_at(height);
+        let wallet_address = wallet_normal.default_address().unwrap();
+        let other_address_one = {
+            let km = rime_core::keys::KeyManager::from_mnemonic_with_network(
+                sample_phrase(),
+                "pass-one",
+                Network::Mainnet,
+            )
+            .unwrap();
+            let sk = km.sapling_spending_key().unwrap();
+            let dfvk = sk
+                .to_full_viewing_key()
+                .as_inner()
+                .to_diversifiable_full_viewing_key();
+            dfvk.default_address().1
+        };
+        let other_address_two = {
+            let km = rime_core::keys::KeyManager::from_mnemonic_with_network(
+                sample_phrase(),
+                "pass-two",
+                Network::Mainnet,
+            )
+            .unwrap();
+            let sk = km.sapling_spending_key().unwrap();
+            let dfvk = sk
+                .to_full_viewing_key()
+                .as_inner()
+                .to_diversifiable_full_viewing_key();
+            dfvk.default_address().1
+        };
+        let outputs = vec![
+            (wallet_address, memo_bytes("wallet memo")),
+            (other_address_one, memo_bytes("memo two")),
+            (other_address_two, memo_bytes("memo three")),
+        ];
+        let (compact_tx, raw_tx, txid) = build_sapling_transaction(&outputs);
+        let mut blocks = Vec::new();
+        let prev_height = height.saturating_sub(1);
+        let prev_block = CompactBlock {
+            proto_version: 0,
+            height: prev_height as u64,
+            hash: vec![0x33; 32],
+            prev_hash: block_hash(prev_height.saturating_sub(1)),
+            ..CompactBlock::default()
+        };
+        blocks.push(prev_block.clone());
+        let block = CompactBlock {
+            proto_version: 0,
+            height: height as u64,
+            hash: vec![0x55; 32],
+            prev_hash: prev_block.hash.clone(),
+            time: 0,
+            header: Vec::new(),
+            vtx: vec![compact_tx.clone()],
+            chain_metadata: None,
+        };
+        blocks.push(block);
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            txid,
+            RawTransaction {
+                data: raw_tx.clone(),
+                height: height as u64,
+            },
+        );
+        let (source_normal, counter_normal) =
+            build_counting_source(blocks.clone(), transactions.clone());
+        let store = WalletStore::in_memory().unwrap();
+        let mut syncer = WalletSyncer::new(
+            wallet_normal,
+            source_normal,
+            store,
+            PrivacyConfig::default(),
+        )
+        .with_tree_verification(false)
+        .with_header_validation(false);
+        let mut sapling_tree = NoteCommitmentTree::new();
+        let mut orchard_tree = OrchardNoteCommitmentTree::new();
+        syncer
+            .sync_wallet(&mut sapling_tree, &mut orchard_tree)
+            .await
+            .unwrap();
+        assert_eq!(counter_normal.load(Ordering::SeqCst), 0);
+        let notes = syncer.store.list_notes(None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].memo.is_none());
+
+        let privacy = PrivacyConfig {
+            sync_mode: SyncMode::FullMemo,
+            full_memo: Some(FullMemoConfig {
+                require_confirmation: false,
+            }),
+            ..PrivacyConfig::default()
+        };
+        let (source_full, counter_full) = build_counting_source(blocks, transactions);
+        let store_full = WalletStore::in_memory().unwrap();
+        let mut syncer_full = WalletSyncer::new(wallet_full, source_full, store_full, privacy)
+            .with_tree_verification(false)
+            .with_header_validation(false);
+        let mut sapling_tree_full = NoteCommitmentTree::new();
+        let mut orchard_tree_full = OrchardNoteCommitmentTree::new();
+        syncer_full
+            .sync_wallet(&mut sapling_tree_full, &mut orchard_tree_full)
+            .await
+            .unwrap();
+        assert_eq!(counter_full.load(Ordering::SeqCst), 1);
+        let stats = syncer_full.full_memo_stats().unwrap();
+        assert_eq!(stats.memos_cached as usize, outputs.len());
+        let notes_full = syncer_full.store.list_notes(None).unwrap();
+        assert_eq!(notes_full.len(), 1);
+        let memo_text = notes_full[0]
+            .memo_utf8()
+            .map(|m| m.trim_end_matches('\0').to_string());
+        assert_eq!(memo_text.as_deref(), Some("wallet memo"));
     }
 }

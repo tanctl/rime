@@ -20,3 +20,5 @@ indicatif = "0.17"
 prettytable = { package = "prettytable-rs", version = "0.10" }
 serde_json = { workspace = true }
 hex = { workspace = true }
+humantime = "2"
+reqwest = { workspace = true }
