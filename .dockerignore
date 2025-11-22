@@ -1,0 +1,7 @@
+/target
+/.git
+**/*.db
+deploy/pir-server/data1
+deploy/pir-server/data2
+deploy/pir-server/data
+deploy/pir-server/docker-compose.yml

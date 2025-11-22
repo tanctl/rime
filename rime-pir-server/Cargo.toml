@@ -1,0 +1,24 @@
+[package]
+name = "rime-pir-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pir_server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+bincode = { workspace = true }
+clap = { workspace = true }
+rime-core = { path = "../rime-core" }
+rime-lightclient = { path = "../rime-lightclient" }
+rime-pir = { path = "../rime-pir" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }

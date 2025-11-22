@@ -10,6 +10,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 pub mod error;
 pub mod keys;
 pub mod notes;
+pub mod privacy;
 pub mod storage;
 pub mod tree;
 pub mod types;
@@ -22,6 +23,10 @@ pub use keys::{
     Seed, SpendingKey,
 };
 pub use notes::Note;
+pub use privacy::{
+    DetectionKeyConfig, FullMemoConfig, PirConfig, PirServerConfig, PrivacyConfig,
+    PrivacyConfigError, SyncMode,
+};
 pub use storage::WalletStore;
 pub use tree::TreeCheckpoint;
 pub use types::{zatoshi_to_zec, zec_to_zatoshi, Network, NoteId, ZATOSHI_PER_ZEC};
