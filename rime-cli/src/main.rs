@@ -111,13 +111,13 @@ struct SyncArgs {
     #[arg(
         long = "ufvk",
         value_name = "uview",
-        help = "Unified full viewing key used in --ephemeral mode"
+        help = "Unified full viewing key used in --ephemeral or --stateless mode"
     )]
     ufvk: Option<String>,
     #[arg(
         long = "birthday-height",
         value_name = "height",
-        help = "Birthday height hint (used in --ephemeral mode if set)"
+        help = "Birthday height hint (used in --ephemeral or --stateless mode if set)"
     )]
     birthday_height: Option<u32>,
     #[arg(
@@ -165,6 +165,11 @@ struct SyncArgs {
         help = "Path to Tor cache directory (default: <data_dir>/tor/cache)"
     )]
     tor_cache_dir: Option<PathBuf>,
+    #[arg(
+        long = "stateless",
+        help = "Perform a stateless scan: no DB (even in-memory) and no persisted state; notes are streamed and discarded"
+    )]
+    stateless: bool,
 }
 
 #[derive(Debug, Args)]
@@ -493,6 +498,14 @@ fn handle_import_ufvk(args: ImportUfvkArgs, data_dir: &Path) -> CliResult<()> {
 }
 
 async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
+    if args.stateless && args.ephemeral {
+        return Err(boxed(io::Error::other(
+            "--stateless cannot be combined with --ephemeral",
+        )));
+    }
+    if args.stateless {
+        return handle_stateless(args).await;
+    }
     if args.ephemeral {
         return handle_ephemeral_sync(args, data_dir).await;
     }
@@ -728,9 +741,117 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
         .map_err(boxed)?;
     let notes = syncer.store().list_notes(None)?;
     dump_notes(&notes);
+    if notes.is_empty() {
+        println!("No notes found during ephemeral sync.");
+    }
     println!(
         "Ephemeral sync complete: {} blocks, Sapling {}, Orchard {}, end height {}",
         result.blocks_processed, result.notes_found_sapling, result.notes_found_orchard, result.end_height
+    );
+
+    for dir in tor_cleanup {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    Ok(())
+}
+
+async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
+    let ufvk_str = args.ufvk.clone().ok_or_else(|| {
+        boxed(io::Error::other(
+            "--ufvk is required when using --stateless",
+        ))
+    })?;
+    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str)
+        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let birthday = args
+        .birthday_height
+        .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
+    let sapling = ufvk.sapling.clone().ok_or_else(|| {
+        boxed(io::Error::other(
+            "UFVK is missing a Sapling component; Sapling viewing key is required to sync",
+        ))
+    })?;
+    let fvk = rime_core::keys::FullViewingKey::new(sapling);
+    let ivk = fvk.to_incoming_viewing_key();
+    let metadata = WalletMetadata {
+        network: ufvk.network(),
+        birthday_height: birthday,
+        last_synced_height: birthday.saturating_sub(1),
+        unified_fvk: Some(ufvk_str.clone()),
+    };
+    let wallet = Wallet::new(metadata, fvk, ivk, Some(ufvk));
+
+    let mut privacy = args.privacy_config().map_err(boxed)?;
+    if privacy.tor_only {
+        ensure_not_local_endpoint(&args.endpoint)?;
+        ensure_not_local_pir(&privacy)?;
+    }
+    let mut tor_cleanup: Vec<PathBuf> = Vec::new();
+    let tor_manager = if privacy.tor_only {
+        let tor_state_dir = temp_ephemeral_dir("rime-tor-state")?;
+        let tor_cache_dir = temp_ephemeral_dir("rime-tor-cache")?;
+        privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
+        privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
+        tor_cleanup.push(tor_state_dir.clone());
+        tor_cleanup.push(tor_cache_dir.clone());
+        let tor_cfg = LiteTorConfig::new(true, tor_state_dir, tor_cache_dir);
+        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
+        manager
+            .check_connection("check.torproject.org:443")
+            .await
+            .map_err(boxed)?;
+        Some(Arc::new(manager))
+    } else {
+        None
+    };
+
+    let rpc_cfg = args
+        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .map_err(boxed)?;
+    let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
+    let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
+    let grpc_source: Arc<dyn NoteSource> = Arc::new(GrpcNoteSource::new(rpc.clone()));
+    let note_source: Arc<dyn NoteSource> = if privacy.sync_mode == SyncMode::Pir {
+        let pir_cfg = privacy
+            .pir
+            .clone()
+            .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
+        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+            .await
+            .map_err(boxed)?;
+        Arc::new(pir)
+    } else {
+        grpc_source
+    };
+
+    let start_height = wallet
+        .metadata
+        .birthday_height
+        .max(wallet.metadata.last_synced_height.saturating_add(1));
+    let mut total = 0usize;
+    let mut total_sapling = 0usize;
+    let mut total_orchard = 0usize;
+    let stats = rime_lightclient::stateless_scan(
+        &wallet,
+        note_source,
+        start_height,
+        args.batch,
+        |note| {
+            total = total.saturating_add(1);
+            match note.pool {
+                Pool::Sapling => total_sapling = total_sapling.saturating_add(1),
+                Pool::Orchard => total_orchard = total_orchard.saturating_add(1),
+            }
+            print_note_json(note);
+        },
+    )
+    .await?;
+    if total == 0 {
+        println!("No notes found during stateless scan.");
+    }
+    println!(
+        "Stateless scan complete: blocks {}, notes {} (Sapling {}, Orchard {})",
+        stats.blocks_scanned, total, total_sapling, total_orchard
     );
 
     for dir in tor_cleanup {
@@ -1163,21 +1284,29 @@ fn dump_notes(notes: &[rime_core::Note]) {
     let payload: Vec<_> = notes
         .iter()
         .map(|note| {
-            json!({
-                "height": note.height,
-                "pool": format!("{:?}", note.pool),
-                "value_zat": note.value,
-                "value_zec": rime_core::zatoshi_to_zec(note.value as i64),
-                "address": note.address,
-                "spent": note.spent,
-                "memo": note.memo_utf8().unwrap_or_else(|| format!("0x{}", hex::encode(note.memo.as_deref().unwrap_or(&[])))),
-                "position": note.position,
-                "nullifier_hex": hex::encode(note.nullifier),
-                "commitment_hex": hex::encode(note.commitment),
-            })
+            note_to_json(note)
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".into()));
+}
+
+fn note_to_json(note: &rime_core::Note) -> serde_json::Value {
+    json!({
+        "height": note.height,
+        "pool": format!("{:?}", note.pool),
+        "value_zat": note.value,
+        "value_zec": rime_core::zatoshi_to_zec(note.value as i64),
+        "address": note.address,
+        "spent": note.spent,
+        "memo": note.memo_utf8().unwrap_or_else(|| format!("0x{}", hex::encode(note.memo.as_deref().unwrap_or(&[])))),
+        "position": note.position,
+        "nullifier_hex": hex::encode(note.nullifier),
+        "commitment_hex": hex::encode(note.commitment),
+    })
+}
+
+fn print_note_json(note: &rime_core::Note) {
+    println!("{}", serde_json::to_string(&note_to_json(note)).unwrap_or_else(|_| "{}".into()));
 }
 
 fn shorten_address(addr: &str) -> String {

@@ -1187,7 +1187,7 @@ fn validate_block_header(block: &CompactBlock) -> Result<BlockHeader, SyncError>
     Ok(header)
 }
 
-fn serialize_rseed(rseed: &Rseed) -> (bool, [u8; 32]) {
+pub(crate) fn serialize_rseed(rseed: &Rseed) -> (bool, [u8; 32]) {
     match rseed {
         Rseed::AfterZip212(bytes) => (true, *bytes),
         Rseed::BeforeZip212(before) => {
@@ -1209,7 +1209,7 @@ fn note_nullifier(bytes: &[u8]) -> Result<[u8; 32], SyncError> {
 }
 
 #[allow(clippy::result_large_err)]
-fn pack_note_id(pool: Pool, height: u32, position: u64) -> Result<NoteId, SyncError> {
+pub(crate) fn pack_note_id(pool: Pool, height: u32, position: u64) -> Result<NoteId, SyncError> {
     if position > u32::MAX as u64 {
         return Err(SyncError::Tree("note position overflow".into()));
     }
@@ -1224,7 +1224,7 @@ fn pack_note_id(pool: Pool, height: u32, position: u64) -> Result<NoteId, SyncEr
     Ok(NoteId::new(packed as i64))
 }
 
-fn zip212_enforcement(network: Network, height: u32) -> Zip212Enforcement {
+pub(crate) fn zip212_enforcement(network: Network, height: u32) -> Zip212Enforcement {
     use zcash_protocol::consensus::{NetworkUpgrade, MAIN_NETWORK, TEST_NETWORK};
 
     let activation = match network {
