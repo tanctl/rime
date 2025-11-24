@@ -223,7 +223,15 @@ impl GrpcRpcClient {
             let mut client = self.client.lock().await;
             match op(&mut client).await {
                 Ok(value) => return Ok(value),
-                Err(_err) => {
+                Err(err) => {
+                    let attempt_number = attempt + 1;
+                    tracing::warn!(
+                        attempt = attempt_number,
+                        max_retries = self.config.max_retries,
+                        endpoint = %self.config.endpoint,
+                        error = %err,
+                        "RPC call failed; retrying"
+                    );
                     if attempt >= self.config.max_retries {
                         return Err(RpcError::BackoffExceeded);
                     }

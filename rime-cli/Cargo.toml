@@ -22,3 +22,10 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 humantime = "2"
 reqwest = { workspace = true }
+zcash_protocol = { workspace = true }
+rand = { workspace = true }
+arti-client = { workspace = true }
+tor-rtcompat = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

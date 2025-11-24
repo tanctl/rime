@@ -4222,24 +4222,29 @@ dependencies = [
 name = "rime-cli"
 version = "0.1.0"
 dependencies = [
+ "arti-client",
  "bip0039",
  "clap",
  "hex",
  "humantime",
  "indicatif",
  "prettytable-rs",
+ "rand 0.8.5",
  "reqwest",
  "rime-core",
  "rime-lightclient",
  "rpassword",
  "sapling-crypto",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tor-rtcompat",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "zcash_keys",
  "zcash_primitives",
+ "zcash_protocol 0.7.1",
 ]
 
 [[package]]

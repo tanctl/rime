@@ -371,6 +371,10 @@ impl WalletSyncer {
         self
     }
 
+    pub fn store(&self) -> &WalletStore {
+        &self.store
+    }
+
     fn full_memo_enabled(&self) -> bool {
         matches!(self.privacy.sync_mode, SyncMode::FullMemo)
     }

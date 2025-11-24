@@ -14,13 +14,16 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use humantime::parse_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use prettytable::{Cell, Row, Table};
+use rand::{thread_rng, Rng};
+use arti_client::TorClient;
+use tor_rtcompat::PreferredRuntime;
 use rime_core::{
     decrypt_seed, encrypt_seed,
     keys::KeyManager,
     notes::Pool,
     tree::{NoteCommitmentTree, OrchardNoteCommitmentTree},
-    FullMemoConfig, Network, PirConfig, PirServerConfig, PrivacyConfig, SyncMode, Wallet,
-    WalletMetadata, WalletSeed, WalletStore,
+    FullMemoConfig, Network, PirConfig, PirServerConfig, PrivacyConfig, SyncMode,
+    UnifiedFullViewingKey, Wallet, WalletMetadata, WalletSeed, WalletStore,
 };
 use rime_lightclient::{
     create_pir_source, estimate_full_memo_bandwidth, rpc::RpcConfig, GrpcNoteSource, GrpcRpcClient,
@@ -36,6 +39,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt as tracing_fmt, EnvFilter};
 use zcash_keys::encoding::encode_payment_address_p;
 use zcash_primitives::consensus::{MainNetwork, TestNetwork};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters, MAIN_NETWORK, TEST_NETWORK};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +65,7 @@ enum Commands {
     Balance(BalanceArgs),
     History(HistoryArgs),
     Keys(KeysArgs),
+    ImportUfvk(ImportUfvkArgs),
     Seed,
 }
 
@@ -70,6 +75,18 @@ struct InitArgs {
     network: CliNetwork,
     #[arg(long, default_value_t = 0)]
     birthday_height: u32,
+}
+
+#[derive(Debug, Args)]
+struct ImportUfvkArgs {
+    #[arg(long, value_name = "uview", help = "Unified full viewing key (uview) to import")]
+    ufvk: String,
+    #[arg(
+        long,
+        value_name = "height",
+        help = "Birthday height for the imported wallet (defaults to Sapling activation for the UFVK network)"
+    )]
+    birthday_height: Option<u32>,
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +103,35 @@ struct SyncArgs {
         help = "Select how to sync and fetch shielded outputs"
     )]
     sync_mode: Option<CliSyncMode>,
+    #[arg(
+        long = "ephemeral",
+        help = "Run a one-shot, in-memory sync with no disk state; requires --ufvk"
+    )]
+    ephemeral: bool,
+    #[arg(
+        long = "ufvk",
+        value_name = "uview",
+        help = "Unified full viewing key used in --ephemeral mode"
+    )]
+    ufvk: Option<String>,
+    #[arg(
+        long = "birthday-height",
+        value_name = "height",
+        help = "Birthday height hint (used in --ephemeral mode if set)"
+    )]
+    birthday_height: Option<u32>,
+    #[arg(
+        long = "rpc-timeout",
+        value_name = "duration",
+        help = "RPC timeout (e.g. 15s, 30s); overrides default"
+    )]
+    rpc_timeout: Option<String>,
+    #[arg(
+        long = "rpc-retries",
+        value_name = "n",
+        help = "RPC retry attempts before failing (default 3)"
+    )]
+    rpc_retries: Option<u32>,
     #[arg(
         long = "pir-server",
         value_name = "url",
@@ -287,6 +333,28 @@ impl SyncArgs {
             None => Ok(Duration::from_secs(60)),
         }
     }
+
+    fn rpc_config(
+        &self,
+        network: Network,
+        tor_client: Option<Arc<TorClient<PreferredRuntime>>>,
+    ) -> Result<RpcConfig, CliConfigError> {
+        let mut cfg = RpcConfig {
+            endpoint: self.endpoint.clone(),
+            network,
+            tor_client,
+            timeout: Duration::from_secs(20),
+            max_retries: 6,
+        };
+        if let Some(raw) = &self.rpc_timeout {
+            cfg.timeout = parse_duration(raw)
+                .map_err(|err| CliConfigError::new(format!("invalid --rpc-timeout: {err}")))?;
+        }
+        if let Some(retries) = self.rpc_retries {
+            cfg.max_retries = retries;
+        }
+        Ok(cfg)
+    }
 }
 
 type CliResult<T> = Result<T, Box<dyn Error>>;
@@ -313,7 +381,8 @@ async fn main() -> CliResult<()> {
     let cli = Cli::parse();
     let data_dir = prepare_data_dir(cli.data_dir);
     fs::create_dir_all(&data_dir)?;
-    let _guard = init_tracing(&data_dir, cli.verbose)?;
+    let disable_logs = matches!(&cli.command, Commands::Sync(args) if args.ephemeral);
+    let _guard = init_tracing(&data_dir, cli.verbose, disable_logs)?;
 
     match cli.command {
         Commands::Init(args) => handle_init(args, &data_dir)?,
@@ -321,6 +390,7 @@ async fn main() -> CliResult<()> {
         Commands::Balance(args) => handle_balance(args, &data_dir)?,
         Commands::History(args) => handle_history(args, &data_dir)?,
         Commands::Keys(args) => handle_keys(args, &data_dir)?,
+        Commands::ImportUfvk(args) => handle_import_ufvk(args, &data_dir)?,
         Commands::Seed => handle_seed(&data_dir)?,
     }
 
@@ -365,7 +435,7 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
     let encrypted = encrypt_seed(&wallet_seed, &enc_pass).map_err(boxed)?;
 
     fs::create_dir_all(data_dir)?;
-    let db_path = data_dir.join("wallet.db");
+    let db_path = wallet_db_path(data_dir);
     let mut store = WalletStore::open(&db_path)?;
     store.save_wallet(&wallet, &encrypted.payload, &encrypted.salt)?;
     info!("initialized wallet database at {}", db_path.display());
@@ -386,7 +456,46 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn handle_import_ufvk(args: ImportUfvkArgs, data_dir: &Path) -> CliResult<()> {
+    let ufvk = UnifiedFullViewingKey::decode_uview(&args.ufvk)
+        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let birthday = args
+        .birthday_height
+        .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
+    let sapling = ufvk.sapling.clone().ok_or_else(|| {
+        boxed(io::Error::other(
+            "UFVK is missing a Sapling component; Sapling viewing key is required to sync",
+        ))
+    })?;
+    let fvk = rime_core::keys::FullViewingKey::new(sapling);
+    let ivk = fvk.to_incoming_viewing_key();
+    let metadata = WalletMetadata {
+        network: ufvk.network(),
+        birthday_height: birthday,
+        last_synced_height: birthday.saturating_sub(1),
+        unified_fvk: Some(args.ufvk.clone()),
+    };
+    let wallet = Wallet::new(metadata, fvk, ivk, Some(ufvk));
+
+    fs::create_dir_all(data_dir)?;
+    let db_path = data_dir.join("wallet.db");
+    let mut store = WalletStore::open(&db_path)?;
+    store.save_wallet(&wallet, &[], &[])?;
+    println!(
+        "Imported UFVK for {:?} (birthday {}).",
+        wallet.metadata.network, wallet.metadata.birthday_height
+    );
+    if let Ok(ua) = wallet.default_unified_address() {
+        println!("Unified Address: {}", ua);
+    }
+    println!("Note: seed material is not stored; seed export and Orchard migration require the original mnemonic.");
+    Ok(())
+}
+
 async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
+    if args.ephemeral {
+        return handle_ephemeral_sync(args, data_dir).await;
+    }
     let db_path = wallet_db_path(data_dir);
     let mut store = WalletStore::open(&db_path)?;
     let mut wallet = store.load_wallet()?;
@@ -441,13 +550,10 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     } else {
         None
     };
-    let rpc_client = GrpcRpcClient::connect(RpcConfig {
-        endpoint: args.endpoint.clone(),
-        network: wallet.metadata.network,
-        tor_client: tor_manager.as_ref().map(|m| m.client()),
-        ..RpcConfig::default()
-    })
-    .await?;
+    let rpc_cfg = args
+        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .map_err(boxed)?;
+    let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
     let mut pir_handle: Option<Arc<PirNoteSource>> = None;
     if sync_mode == SyncMode::FullMemo && privacy.full_memo.is_some() {
@@ -538,6 +644,97 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     }
     if let Some(pir_source) = pir_handle {
         show_pir_stats(&pir_source).await;
+    }
+    Ok(())
+}
+
+async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()> {
+    let ufvk_str = args.ufvk.clone().ok_or_else(|| {
+        boxed(io::Error::other(
+            "--ufvk is required when using --ephemeral",
+        ))
+    })?;
+    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str)
+        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let birthday = args
+        .birthday_height
+        .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
+    let sapling = ufvk.sapling.clone().ok_or_else(|| {
+        boxed(io::Error::other(
+            "UFVK is missing a Sapling component; Sapling viewing key is required to sync",
+        ))
+    })?;
+    let fvk = rime_core::keys::FullViewingKey::new(sapling);
+    let ivk = fvk.to_incoming_viewing_key();
+    let metadata = WalletMetadata {
+        network: ufvk.network(),
+        birthday_height: birthday,
+        last_synced_height: birthday.saturating_sub(1),
+        unified_fvk: Some(ufvk_str.clone()),
+    };
+    let wallet = Wallet::new(metadata, fvk, ivk, Some(ufvk));
+
+    let mut privacy = args.privacy_config().map_err(boxed)?;
+    if privacy.tor_only {
+        ensure_not_local_endpoint(&args.endpoint)?;
+        ensure_not_local_pir(&privacy)?;
+    }
+    let mut tor_cleanup: Vec<PathBuf> = Vec::new();
+    let tor_manager = if privacy.tor_only {
+        let tor_state_dir = temp_ephemeral_dir("rime-tor-state")?;
+        let tor_cache_dir = temp_ephemeral_dir("rime-tor-cache")?;
+        privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
+        privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
+        tor_cleanup.push(tor_state_dir.clone());
+        tor_cleanup.push(tor_cache_dir.clone());
+        let tor_cfg = LiteTorConfig::new(true, tor_state_dir, tor_cache_dir);
+        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
+        manager
+            .check_connection("check.torproject.org:443")
+            .await
+            .map_err(boxed)?;
+        Some(Arc::new(manager))
+    } else {
+        None
+    };
+
+    let rpc_cfg = args
+        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .map_err(boxed)?;
+    let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
+    let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
+    let grpc_source: Arc<dyn NoteSource> = Arc::new(GrpcNoteSource::new(rpc.clone()));
+    let note_source: Arc<dyn NoteSource> = if privacy.sync_mode == SyncMode::Pir {
+        let pir_cfg = privacy
+            .pir
+            .clone()
+            .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
+        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+            .await
+            .map_err(boxed)?;
+        Arc::new(pir)
+    } else {
+        grpc_source
+    };
+
+    let store = WalletStore::in_memory().map_err(boxed)?;
+    let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
+        .with_batch_size(args.batch);
+    let mut sapling_tree = NoteCommitmentTree::new();
+    let mut orchard_tree = OrchardNoteCommitmentTree::new();
+    let result = syncer
+        .sync_wallet(&mut sapling_tree, &mut orchard_tree)
+        .await
+        .map_err(boxed)?;
+    let notes = syncer.store().list_notes(None)?;
+    dump_notes(&notes);
+    println!(
+        "Ephemeral sync complete: {} blocks, Sapling {}, Orchard {}, end height {}",
+        result.blocks_processed, result.notes_found_sapling, result.notes_found_orchard, result.end_height
+    );
+
+    for dir in tor_cleanup {
+        let _ = fs::remove_dir_all(&dir);
     }
     Ok(())
 }
@@ -679,6 +876,11 @@ fn handle_seed(data_dir: &Path) -> CliResult<()> {
     let db_path = wallet_db_path(data_dir);
     let store = WalletStore::open(&db_path)?;
     let (encrypted_seed, salt) = store.load_encrypted_seed()?;
+    if encrypted_seed.is_empty() || salt.is_empty() {
+        return Err(boxed(io::Error::other(
+            "seed export unavailable: this wallet was imported from a UFVK",
+        )));
+    }
     let pass = prompt_password("wallet encryption password: ")?;
     let wallet_seed = decrypt_seed(&encrypted_seed, &salt, &pass)?;
     println!("{}", hex::encode(wallet_seed.as_bytes()));
@@ -723,33 +925,64 @@ fn prepare_data_dir(path: PathBuf) -> PathBuf {
     path
 }
 
-fn init_tracing(data_dir: &Path, verbose: bool) -> CliResult<WorkerGuard> {
-    let log_dir = data_dir.join("logs");
-    fs::create_dir_all(&log_dir)?;
-    let file_appender = tracing_appender::rolling::daily(log_dir, "rime.log");
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-
+fn init_tracing(data_dir: &Path, verbose: bool, disable_logs: bool) -> CliResult<Option<WorkerGuard>> {
     let level = if verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let console_layer = tracing_fmt::layer().with_writer(std::io::stderr);
-    let file_layer = tracing_fmt::layer()
-        .with_ansi(false)
-        .with_writer(file_writer);
+    if disable_logs {
+        let console_layer = tracing_fmt::layer().with_writer(std::io::stderr);
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .try_init()
+            .map_err(|e| boxed(e))?;
+        Ok(None)
+    } else {
+        let log_dir = data_dir.join("logs");
+        fs::create_dir_all(&log_dir)?;
+        let file_appender = tracing_appender::rolling::daily(log_dir, "rime.log");
+        let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(console_layer)
-        .with(file_layer)
-        .try_init()
-        .map_err(|e| boxed(e))?;
+        let console_layer = tracing_fmt::layer().with_writer(std::io::stderr);
+        let file_layer = tracing_fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer);
 
-    Ok(guard)
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .with(file_layer)
+            .try_init()
+            .map_err(|e| boxed(e))?;
+
+        Ok(Some(guard))
+    }
 }
 
 fn encode_payment_address(network: Network, addr: &SaplingPaymentAddress) -> String {
     match network {
         Network::Mainnet => encode_payment_address_p(&MainNetwork, addr),
         Network::Testnet => encode_payment_address_p(&TestNetwork, addr),
+    }
+}
+
+fn temp_ephemeral_dir(prefix: &str) -> io::Result<PathBuf> {
+    let mut path = std::env::temp_dir();
+    let mut rng = thread_rng();
+    path.push(format!("{}-{}", prefix, rng.gen::<u64>()));
+    fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
+fn sapling_activation_height(network: Network) -> u32 {
+    match network {
+        Network::Mainnet => MAIN_NETWORK
+            .activation_height(NetworkUpgrade::Sapling)
+            .map(u32::from)
+            .unwrap_or(0),
+        Network::Testnet => TEST_NETWORK
+            .activation_height(NetworkUpgrade::Sapling)
+            .map(u32::from)
+            .unwrap_or(0),
     }
 }
 
@@ -771,6 +1004,18 @@ fn wallet_missing_orchard(wallet: &Wallet) -> bool {
 
 fn maybe_prompt_orchard_upgrade(store: &mut WalletStore, wallet: &mut Wallet) -> CliResult<()> {
     if !wallet_missing_orchard(wallet) {
+        return Ok(());
+    }
+    let seed_available = store
+        .load_encrypted_seed()
+        .map(|(cipher, salt)| !cipher.is_empty() && !salt.is_empty())
+        .unwrap_or(false);
+    if !seed_available {
+        if !ORCHARD_WARNING_SHOWN.swap(true, Ordering::SeqCst) {
+            println!();
+            println!("This wallet was imported from a UFVK and has no seed; Orchard migration requires the original mnemonic.");
+            println!();
+        }
         return Ok(());
     }
     println!();
@@ -848,6 +1093,11 @@ fn perform_orchard_migration(
         return Ok(MigrationStatus::AlreadyUpgraded);
     }
     let (encrypted_seed, salt) = store.load_encrypted_seed()?;
+    if encrypted_seed.is_empty() || salt.is_empty() {
+        return Err(boxed(io::Error::other(
+            "cannot migrate Orchard: this wallet was imported from a UFVK and has no seed",
+        )));
+    }
     let pass = prompt_password("wallet encryption password: ")?;
     let wallet_seed = decrypt_seed(&encrypted_seed, &salt, &pass)?;
     let km = KeyManager::from_seed_bytes(wallet_seed.as_bytes(), wallet.metadata.network);
@@ -907,6 +1157,27 @@ fn memo_display(note: &rime_core::Note) -> String {
     } else {
         "-".to_string()
     }
+}
+
+fn dump_notes(notes: &[rime_core::Note]) {
+    let payload: Vec<_> = notes
+        .iter()
+        .map(|note| {
+            json!({
+                "height": note.height,
+                "pool": format!("{:?}", note.pool),
+                "value_zat": note.value,
+                "value_zec": rime_core::zatoshi_to_zec(note.value as i64),
+                "address": note.address,
+                "spent": note.spent,
+                "memo": note.memo_utf8().unwrap_or_else(|| format!("0x{}", hex::encode(note.memo.as_deref().unwrap_or(&[])))),
+                "position": note.position,
+                "nullifier_hex": hex::encode(note.nullifier),
+                "commitment_hex": hex::encode(note.commitment),
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".into()));
 }
 
 fn shorten_address(addr: &str) -> String {
@@ -1023,5 +1294,59 @@ mod tests {
             "https://b",
         ]);
         assert!(args.privacy_config().is_err());
+    }
+
+    fn sample_phrase() -> &'static str {
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art"
+    }
+
+    #[test]
+    fn import_ufvk_creates_wallet_without_seed() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let km = KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Testnet)
+            .unwrap();
+        let ufvk = km.unified_full_viewing_key().unwrap().encode_uview().unwrap();
+        handle_import_ufvk(
+            ImportUfvkArgs {
+                ufvk: ufvk.clone(),
+                birthday_height: Some(5),
+            },
+            dir.path(),
+        )
+        .unwrap();
+        let store = WalletStore::open(wallet_db_path(dir.path())).unwrap();
+        let wallet = store.load_wallet().unwrap();
+        assert_eq!(wallet.metadata.network, Network::Testnet);
+        assert_eq!(wallet.metadata.birthday_height, 5);
+        let (cipher, salt) = store.load_encrypted_seed().unwrap();
+        assert!(cipher.is_empty());
+        assert!(salt.is_empty());
+        assert_eq!(wallet.metadata.unified_fvk.as_deref(), Some(ufvk.as_str()));
+    }
+
+    #[test]
+    fn import_ufvk_defaults_birthday_to_activation() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let km = KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Mainnet)
+            .unwrap();
+        let ufvk = km.unified_full_viewing_key().unwrap().encode_uview().unwrap();
+        handle_import_ufvk(
+            ImportUfvkArgs {
+                ufvk: ufvk.clone(),
+                birthday_height: None,
+            },
+            dir.path(),
+        )
+        .unwrap();
+        let store = WalletStore::open(wallet_db_path(dir.path())).unwrap();
+        let wallet = store.load_wallet().unwrap();
+        assert_eq!(
+            wallet.metadata.birthday_height,
+            sapling_activation_height(Network::Mainnet)
+        );
     }
 }
