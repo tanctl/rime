@@ -1,6 +1,7 @@
 use std::{io, path::PathBuf, sync::Arc};
 
-use arti_client::{config::TorClientConfigBuilder, TorClient};
+use arti_client::{config::TorClientConfigBuilder, IsolationToken, StreamPrefs, TorClient};
+use rand::Rng;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tor_rtcompat::PreferredRuntime;
@@ -10,6 +11,8 @@ pub struct TorConfig {
     pub enabled: bool,
     pub state_dir: PathBuf,
     pub cache_dir: PathBuf,
+    pub isolate: bool,
+    pub isolation_group: Option<String>,
 }
 
 impl TorConfig {
@@ -18,6 +21,8 @@ impl TorConfig {
             enabled,
             state_dir,
             cache_dir,
+            isolate: false,
+            isolation_group: None,
         }
     }
 
@@ -26,6 +31,8 @@ impl TorConfig {
             enabled: false,
             state_dir: PathBuf::new(),
             cache_dir: PathBuf::new(),
+            isolate: false,
+            isolation_group: None,
         }
     }
 }
@@ -40,6 +47,8 @@ pub enum TorError {
 
 pub struct TorManager {
     client: Arc<TorClient<PreferredRuntime>>,
+    isolate: bool,
+    isolation_token: Option<IsolationToken>,
     pub config: TorConfig,
 }
 
@@ -56,8 +65,15 @@ impl TorManager {
             .create_bootstrapped()
             .await
             .map_err(|e| TorError::Client(e.to_string()))?;
+        let isolation_token = if config.isolate {
+            Some(IsolationToken::new())
+        } else {
+            None
+        };
         Ok(Self {
             client: Arc::new(tor_client),
+            isolate: config.isolate,
+            isolation_token,
             config,
         })
     }
@@ -70,12 +86,27 @@ impl TorManager {
         &self,
         addr: &str,
     ) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send + 'static, TorError> {
+        if self.isolate {
+            let delay = rand::thread_rng().gen_range(10..50);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let mut prefs = StreamPrefs::new();
+        if let Some(tok) = self.isolation_token.as_ref() {
+            prefs.set_isolation(*tok);
+        }
         let stream = self
             .client
-            .connect(addr)
+            .connect_with_prefs(addr, &prefs)
             .await
             .map_err(|e| TorError::Client(e.to_string()))?;
         Ok(stream)
+    }
+
+    pub async fn wait_for_bootstrap(&self) -> Result<(), TorError> {
+        self.client
+            .bootstrap()
+            .await
+            .map_err(|e| TorError::Client(e.to_string()))
     }
 
     pub async fn check_connection(&self, target: &str) -> Result<(), TorError> {

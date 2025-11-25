@@ -166,6 +166,11 @@ struct SyncArgs {
     #[arg(long = "tor-only", help = "Require all network activity to use Tor")]
     tor_only: bool,
     #[arg(
+        long = "tor-isolate",
+        help = "Enable strict Tor privacy isolation (fresh identity, separate RPC/PIR circuits, DNS-over-Tor, jitter, and timeout hardening)."
+    )]
+    tor_isolate: bool,
+    #[arg(
         long = "tor-state-dir",
         value_name = "path",
         help = "Path to Tor state directory (default: <data_dir>/tor/state)"
@@ -274,6 +279,9 @@ impl From<CliNetwork> for Network {
 
 impl SyncArgs {
     fn privacy_config(&self) -> Result<PrivacyConfig, CliConfigError> {
+        if self.tor_isolate && !self.tor_only {
+            return Err(CliConfigError::new("`--tor-isolate` requires `--tor-only`"));
+        }
         let cli_mode = self.sync_mode.unwrap_or(CliSyncMode::Normal);
         let sync_mode = SyncMode::from(cli_mode);
         if !matches!(sync_mode, SyncMode::Pir) {
@@ -290,6 +298,7 @@ impl SyncArgs {
                 .tor_cache_dir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
+            tor_isolate: self.tor_isolate,
             ..PrivacyConfig::default()
         };
         match sync_mode {
@@ -402,6 +411,7 @@ impl SyncArgs {
             tor_client,
             timeout: Duration::from_secs(20),
             max_retries: 6,
+            tor_isolate: self.tor_isolate,
         };
         if let Some(raw) = &self.rpc_timeout {
             cfg.timeout = parse_duration(raw)
@@ -409,6 +419,9 @@ impl SyncArgs {
         }
         if let Some(retries) = self.rpc_retries {
             cfg.max_retries = retries;
+        }
+        if self.tor_isolate {
+            cfg.timeout = cfg.timeout.max(Duration::from_secs(10));
         }
         Ok(cfg)
     }
@@ -595,37 +608,75 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
             ensure_not_local_pir(&privacy)?;
         }
     }
-    let tor_state_dir = args
-        .tor_state_dir
-        .clone()
-        .unwrap_or_else(|| default_tor_path(data_dir, "state"));
-    let tor_cache_dir = args
-        .tor_cache_dir
-        .clone()
-        .unwrap_or_else(|| default_tor_path(data_dir, "cache"));
+    let mut tor_cleanup: Vec<PathBuf> = Vec::new();
+    let (tor_state_dir, tor_cache_dir) = if privacy.tor_only && args.tor_isolate {
+        let state = temp_ephemeral_dir("rime-tor-state")?;
+        let cache = temp_ephemeral_dir("rime-tor-cache")?;
+        tor_cleanup.push(state.clone());
+        tor_cleanup.push(cache.clone());
+        (state, cache)
+    } else {
+        let state = args
+            .tor_state_dir
+            .clone()
+            .unwrap_or_else(|| default_tor_path(data_dir, "state"));
+        let cache = args
+            .tor_cache_dir
+            .clone()
+            .unwrap_or_else(|| default_tor_path(data_dir, "cache"));
+        (state, cache)
+    };
     if privacy.tor_only {
         privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
         privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
     }
-    let tor_manager = if privacy.tor_only {
+    let mut rpc_tor_manager: Option<Arc<TorManager>> = None;
+    let mut pir_tor_manager: Option<Arc<TorManager>> = None;
+    if privacy.tor_only {
         fs::create_dir_all(&tor_state_dir)?;
         fs::create_dir_all(&tor_cache_dir)?;
-        let tor_cfg = LiteTorConfig::new(true, tor_state_dir.clone(), tor_cache_dir.clone());
-        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
-        manager
+        if args.tor_isolate {
+            purge_dir(&tor_state_dir)?;
+            purge_dir(&tor_cache_dir)?;
+        }
+        let mut tor_cfg_base =
+            LiteTorConfig::new(true, tor_state_dir.clone(), tor_cache_dir.clone());
+        tor_cfg_base.isolate = args.tor_isolate;
+        if args.tor_isolate {
+            tor_cfg_base.isolation_group = Some("rime-rpc".into());
+        }
+        let rpc_mgr = TorManager::new(tor_cfg_base.clone()).await.map_err(boxed)?;
+        if args.tor_isolate {
+            rpc_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+        }
+        rpc_mgr
             .check_connection("check.torproject.org:443")
             .await
             .map_err(boxed)?;
-        Some(Arc::new(manager))
-    } else {
-        None
-    };
+        rpc_tor_manager = Some(Arc::new(rpc_mgr));
+        if sync_mode == SyncMode::Pir && args.tor_isolate {
+            let mut tor_cfg_pir = tor_cfg_base.clone();
+            tor_cfg_pir.isolation_group = Some("rime-pir".into());
+            let pir_mgr = TorManager::new(tor_cfg_pir).await.map_err(boxed)?;
+            pir_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+            pir_tor_manager = Some(Arc::new(pir_mgr));
+        }
+    }
     let rpc_cfg = args
         .rpc_config(
             wallet.metadata.network,
-            tor_manager.as_ref().map(|m| m.client()),
+            rpc_tor_manager.as_ref().map(|m| m.client()),
         )
         .map_err(boxed)?;
+    let rpc_cfg = if args.tor_isolate {
+        RpcConfig {
+            timeout: rpc_cfg.timeout.max(Duration::from_secs(10)),
+            tor_isolate: true,
+            ..rpc_cfg
+        }
+    } else {
+        rpc_cfg
+    };
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
     let mut pir_handle: Option<Arc<PirNoteSource>> = None;
@@ -652,14 +703,24 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
             .pir
             .clone()
             .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
-        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+        let tor_for_pir = if args.tor_isolate {
+            pir_tor_manager.clone().or_else(|| rpc_tor_manager.clone())
+        } else {
+            rpc_tor_manager.clone()
+        };
+        let mut hardened_pir_cfg = pir_cfg.clone();
+        if args.tor_isolate {
+            hardened_pir_cfg.dummy_interval =
+                hardened_pir_cfg.dummy_interval.max(Duration::from_secs(10));
+        }
+        let pir = create_pir_source(&hardened_pir_cfg, grpc_source.clone(), tor_for_pir)
             .await
             .map_err(boxed)?;
         let pir_arc = Arc::new(pir);
         let mb_per_hour = pir_arc.estimate_bandwidth_per_hour();
         println!(
             "PIR scheduler: interval {}s (~{:.1} MB/hour).",
-            pir_cfg.dummy_interval.as_secs().max(1),
+            hardened_pir_cfg.dummy_interval.as_secs().max(1),
             mb_per_hour
         );
         pir_handle = Some(pir_arc.clone());
@@ -679,7 +740,7 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     let progress = Arc::new(progress);
     let progress_cb = progress.clone();
     let start = Instant::now();
-    let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
+    let mut syncer = WalletSyncer::new(wallet, note_source.clone(), store, privacy)
         .with_batch_size(args.batch)
         .with_bucket_size(bucket_size)
         .with_smoothing(smoothing)
@@ -717,8 +778,20 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
             );
         }
     }
-    if let Some(pir_source) = pir_handle {
-        show_pir_stats(&pir_source).await;
+    if let Some(ref pir_source) = pir_handle {
+        show_pir_stats(pir_source).await;
+    }
+    drop(syncer);
+    drop(note_source);
+    drop(grpc_source);
+    drop(rpc);
+    drop(pir_handle);
+    drop(pir_tor_manager);
+    drop(rpc_tor_manager);
+    for dir in tor_cleanup {
+        if !args.tor_isolate {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
     Ok(())
 }
@@ -760,30 +833,57 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
         ensure_not_local_pir(&privacy)?;
     }
     let mut tor_cleanup: Vec<PathBuf> = Vec::new();
-    let tor_manager = if privacy.tor_only {
+    let mut rpc_tor_manager: Option<Arc<TorManager>> = None;
+    let mut pir_tor_manager: Option<Arc<TorManager>> = None;
+    if privacy.tor_only {
         let tor_state_dir = temp_ephemeral_dir("rime-tor-state")?;
         let tor_cache_dir = temp_ephemeral_dir("rime-tor-cache")?;
         privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
         privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
         tor_cleanup.push(tor_state_dir.clone());
         tor_cleanup.push(tor_cache_dir.clone());
-        let tor_cfg = LiteTorConfig::new(true, tor_state_dir, tor_cache_dir);
-        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
-        manager
+        if args.tor_isolate {
+            purge_dir(&tor_state_dir)?;
+            purge_dir(&tor_cache_dir)?;
+        }
+        let mut tor_cfg = LiteTorConfig::new(true, tor_state_dir.clone(), tor_cache_dir.clone());
+        tor_cfg.isolate = args.tor_isolate;
+        if args.tor_isolate {
+            tor_cfg.isolation_group = Some("rime-rpc".into());
+        }
+        let rpc_mgr = TorManager::new(tor_cfg.clone()).await.map_err(boxed)?;
+        if args.tor_isolate {
+            rpc_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+        }
+        rpc_mgr
             .check_connection("check.torproject.org:443")
             .await
             .map_err(boxed)?;
-        Some(Arc::new(manager))
-    } else {
-        None
-    };
+        rpc_tor_manager = Some(Arc::new(rpc_mgr));
+        if privacy.sync_mode == SyncMode::Pir && args.tor_isolate {
+            let mut tor_cfg_pir = tor_cfg.clone();
+            tor_cfg_pir.isolation_group = Some("rime-pir".into());
+            let pir_mgr = TorManager::new(tor_cfg_pir).await.map_err(boxed)?;
+            pir_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+            pir_tor_manager = Some(Arc::new(pir_mgr));
+        }
+    }
 
     let rpc_cfg = args
         .rpc_config(
             wallet.metadata.network,
-            tor_manager.as_ref().map(|m| m.client()),
+            rpc_tor_manager.as_ref().map(|m| m.client()),
         )
         .map_err(boxed)?;
+    let rpc_cfg = if args.tor_isolate {
+        RpcConfig {
+            timeout: rpc_cfg.timeout.max(Duration::from_secs(10)),
+            tor_isolate: true,
+            ..rpc_cfg
+        }
+    } else {
+        rpc_cfg
+    };
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
     let grpc_source: Arc<dyn NoteSource> = Arc::new(GrpcNoteSource::new(rpc.clone()));
@@ -792,16 +892,26 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
             .pir
             .clone()
             .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
-        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+        let tor_for_pir = if args.tor_isolate {
+            pir_tor_manager.clone().or_else(|| rpc_tor_manager.clone())
+        } else {
+            rpc_tor_manager.clone()
+        };
+        let mut hardened_pir_cfg = pir_cfg.clone();
+        if args.tor_isolate {
+            hardened_pir_cfg.dummy_interval =
+                hardened_pir_cfg.dummy_interval.max(Duration::from_secs(10));
+        }
+        let pir = create_pir_source(&hardened_pir_cfg, grpc_source.clone(), tor_for_pir)
             .await
             .map_err(boxed)?;
         Arc::new(pir)
     } else {
-        grpc_source
+        grpc_source.clone()
     };
 
     let store = WalletStore::in_memory().map_err(boxed)?;
-    let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
+    let mut syncer = WalletSyncer::new(wallet, note_source.clone(), store, privacy)
         .with_batch_size(args.batch)
         .with_bucket_size(bucket_size)
         .with_smoothing(smoothing);
@@ -824,8 +934,16 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
         result.end_height
     );
 
+    drop(syncer);
+    drop(note_source);
+    drop(grpc_source);
+    drop(rpc);
+    drop(pir_tor_manager);
+    drop(rpc_tor_manager);
     for dir in tor_cleanup {
-        let _ = fs::remove_dir_all(&dir);
+        if !args.tor_isolate {
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
     Ok(())
 }
@@ -867,30 +985,57 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
         ensure_not_local_pir(&privacy)?;
     }
     let mut tor_cleanup: Vec<PathBuf> = Vec::new();
-    let tor_manager = if privacy.tor_only {
+    let mut rpc_tor_manager: Option<Arc<TorManager>> = None;
+    let mut pir_tor_manager: Option<Arc<TorManager>> = None;
+    if privacy.tor_only {
         let tor_state_dir = temp_ephemeral_dir("rime-tor-state")?;
         let tor_cache_dir = temp_ephemeral_dir("rime-tor-cache")?;
         privacy.tor_state_dir = Some(tor_state_dir.to_string_lossy().to_string());
         privacy.tor_cache_dir = Some(tor_cache_dir.to_string_lossy().to_string());
         tor_cleanup.push(tor_state_dir.clone());
         tor_cleanup.push(tor_cache_dir.clone());
-        let tor_cfg = LiteTorConfig::new(true, tor_state_dir, tor_cache_dir);
-        let manager = TorManager::new(tor_cfg).await.map_err(boxed)?;
-        manager
+        if args.tor_isolate {
+            purge_dir(&tor_state_dir)?;
+            purge_dir(&tor_cache_dir)?;
+        }
+        let mut tor_cfg = LiteTorConfig::new(true, tor_state_dir.clone(), tor_cache_dir.clone());
+        tor_cfg.isolate = args.tor_isolate;
+        if args.tor_isolate {
+            tor_cfg.isolation_group = Some("rime-rpc".into());
+        }
+        let rpc_mgr = TorManager::new(tor_cfg.clone()).await.map_err(boxed)?;
+        if args.tor_isolate {
+            rpc_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+        }
+        rpc_mgr
             .check_connection("check.torproject.org:443")
             .await
             .map_err(boxed)?;
-        Some(Arc::new(manager))
-    } else {
-        None
-    };
+        rpc_tor_manager = Some(Arc::new(rpc_mgr));
+        if privacy.sync_mode == SyncMode::Pir && args.tor_isolate {
+            let mut tor_cfg_pir = tor_cfg.clone();
+            tor_cfg_pir.isolation_group = Some("rime-pir".into());
+            let pir_mgr = TorManager::new(tor_cfg_pir).await.map_err(boxed)?;
+            pir_mgr.wait_for_bootstrap().await.map_err(boxed)?;
+            pir_tor_manager = Some(Arc::new(pir_mgr));
+        }
+    }
 
     let rpc_cfg = args
         .rpc_config(
             wallet.metadata.network,
-            tor_manager.as_ref().map(|m| m.client()),
+            rpc_tor_manager.as_ref().map(|m| m.client()),
         )
         .map_err(boxed)?;
+    let rpc_cfg = if args.tor_isolate {
+        RpcConfig {
+            timeout: rpc_cfg.timeout.max(Duration::from_secs(10)),
+            tor_isolate: true,
+            ..rpc_cfg
+        }
+    } else {
+        rpc_cfg
+    };
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
     let grpc_source: Arc<dyn NoteSource> = Arc::new(GrpcNoteSource::new(rpc.clone()));
@@ -899,12 +1044,22 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
             .pir
             .clone()
             .ok_or_else(|| io::Error::other("PIR configuration missing despite --sync-mode pir"))?;
-        let pir = create_pir_source(&pir_cfg, grpc_source.clone(), tor_manager.clone())
+        let tor_for_pir = if args.tor_isolate {
+            pir_tor_manager.clone().or_else(|| rpc_tor_manager.clone())
+        } else {
+            rpc_tor_manager.clone()
+        };
+        let mut hardened_pir_cfg = pir_cfg.clone();
+        if args.tor_isolate {
+            hardened_pir_cfg.dummy_interval =
+                hardened_pir_cfg.dummy_interval.max(Duration::from_secs(10));
+        }
+        let pir = create_pir_source(&hardened_pir_cfg, grpc_source.clone(), tor_for_pir)
             .await
             .map_err(boxed)?;
         Arc::new(pir)
     } else {
-        grpc_source
+        grpc_source.clone()
     };
 
     let start_height = wallet
@@ -916,7 +1071,7 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
     let mut total_orchard = 0usize;
     let stats = rime_lightclient::stateless_scan(
         &wallet,
-        note_source,
+        note_source.clone(),
         start_height,
         args.batch,
         bucket_size,
@@ -939,8 +1094,15 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
         stats.blocks_scanned, total, total_sapling, total_orchard
     );
 
+    drop(note_source);
+    drop(grpc_source);
+    drop(rpc);
+    drop(pir_tor_manager);
+    drop(rpc_tor_manager);
     for dir in tor_cleanup {
-        let _ = fs::remove_dir_all(&dir);
+        if !args.tor_isolate {
+            let _ = fs::remove_dir_all(&dir);
+        }
     }
     Ok(())
 }
@@ -1181,6 +1343,22 @@ fn temp_ephemeral_dir(prefix: &str) -> io::Result<PathBuf> {
     path.push(format!("{}-{}", prefix, rng.gen::<u64>()));
     fs::create_dir_all(&path)?;
     Ok(path)
+}
+
+fn purge_dir(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_dir() {
+            fs::remove_dir_all(&p)?;
+        } else {
+            fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
 }
 
 fn sapling_activation_height(network: Network) -> u32 {

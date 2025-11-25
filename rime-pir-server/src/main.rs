@@ -273,6 +273,7 @@ async fn build_database_from_chain(
         max_retries: 5,
         network,
         tor_client: None,
+        tor_isolate: false,
     };
     let client = GrpcRpcClient::connect(config).await?;
     let mut records = Vec::new();

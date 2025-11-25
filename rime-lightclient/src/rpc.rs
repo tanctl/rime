@@ -1,6 +1,7 @@
 use arti_client::TorClient;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
+use rand::Rng;
 use rime_core::Network;
 use std::io;
 use std::{sync::Arc, time::Duration};
@@ -47,6 +48,7 @@ pub struct RpcConfig {
     pub max_retries: u32,
     pub network: Network,
     pub tor_client: Option<Arc<TorClient<PreferredRuntime>>>,
+    pub tor_isolate: bool,
 }
 
 impl Default for RpcConfig {
@@ -57,6 +59,7 @@ impl Default for RpcConfig {
             max_retries: 3,
             network: Network::Testnet,
             tor_client: None,
+            tor_isolate: false,
         }
     }
 }
@@ -97,7 +100,7 @@ impl GrpcRpcClient {
             .timeout(config.timeout)
             .connect_timeout(config.timeout);
         let channel = if let Some(tor) = config.tor_client.clone() {
-            Self::connect_with_tor(base, use_plaintext, tor).await?
+            Self::connect_with_tor(base, use_plaintext, tor, config.tor_isolate).await?
         } else if use_plaintext {
             base.connect().await?
         } else {
@@ -124,7 +127,12 @@ impl GrpcRpcClient {
         mut base: Endpoint,
         use_plaintext: bool,
         tor: Arc<TorClient<PreferredRuntime>>,
+        isolate: bool,
     ) -> Result<Channel, RpcError> {
+        if isolate {
+            let delay = rand::thread_rng().gen_range(10..50);
+            sleep(Duration::from_millis(delay)).await;
+        }
         if !use_plaintext {
             let tls = ClientTlsConfig::new().with_native_roots();
             base = base.tls_config(tls)?;
@@ -220,6 +228,10 @@ impl GrpcRpcClient {
         let mut delay = Duration::from_millis(250);
         let mut attempt = 0u32;
         loop {
+            if self.config.tor_isolate {
+                let jitter = rand::thread_rng().gen_range(10..50);
+                sleep(Duration::from_millis(jitter)).await;
+            }
             let mut client = self.client.lock().await;
             match op(&mut client).await {
                 Ok(value) => return Ok(value),

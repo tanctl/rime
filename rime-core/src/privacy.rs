@@ -51,6 +51,7 @@ pub struct PrivacyConfig {
     pub tor_only: bool,
     pub tor_state_dir: Option<String>,
     pub tor_cache_dir: Option<String>,
+    pub tor_isolate: bool,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -63,6 +64,8 @@ pub enum PrivacyConfigError {
     PirServerCount,
     #[error("PIR dummy interval must be at least 10 seconds")]
     InvalidPirInterval,
+    #[error("tor isolation requires tor-only mode")]
+    TorIsolateRequiresTor,
 }
 
 impl PrivacyConfig {
@@ -86,6 +89,9 @@ impl PrivacyConfig {
                     return Err(PrivacyConfigError::InvalidPirInterval);
                 }
             }
+        }
+        if self.tor_isolate && !self.tor_only {
+            return Err(PrivacyConfigError::TorIsolateRequiresTor);
         }
         Ok(())
     }
@@ -122,5 +128,17 @@ mod tests {
             },
         ];
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tor_isolate_requires_tor_only() {
+        let cfg = PrivacyConfig {
+            tor_isolate: true,
+            ..PrivacyConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(PrivacyConfigError::TorIsolateRequiresTor)
+        );
     }
 }
