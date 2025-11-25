@@ -1,14 +1,20 @@
 use orchard::keys::Scope as OrchardScope;
 use rime_core::{notes::Pool, Note, Wallet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::{
     rpc::CompactBlock,
     source::NoteSource,
-    sync::{pack_note_id, serialize_rseed, zip212_enforcement, OrchardDecryption, SaplingDecryption, TrialDecryptor},
+    sync::{
+        pack_note_id, serialize_rseed, zip212_enforcement, OrchardDecryption, SaplingDecryption,
+        SmoothingConfig, TrialDecryptor,
+    },
     SyncError,
 };
 use hex;
+use std::hint::black_box;
+use tokio::time::sleep;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct StatelessStats {
@@ -24,12 +30,14 @@ pub async fn stateless_scan(
     source: Arc<dyn NoteSource>,
     start_height: u32,
     batch_size: u32,
+    bucket_size: u32,
+    smoothing: Option<SmoothingConfig>,
     mut on_note: impl FnMut(&Note),
 ) -> Result<StatelessStats, SyncError> {
-    let latest = source.latest_height().await?;
-    if start_height > latest {
-        return Ok(StatelessStats::default());
-    }
+    let bucket = bucket_size.max(1);
+    let latest_raw = source.latest_height().await?;
+    let latest = super::sync::round_end_height(latest_raw, bucket);
+    let mut cursor = (start_height / bucket) * bucket;
 
     let orchard_ivk = wallet
         .unified_fvk
@@ -42,13 +50,15 @@ pub async fn stateless_scan(
     let mut sapling_position: u64 = 0;
     let mut orchard_position: u64 = 0;
 
-    let mut cursor = start_height;
     while cursor <= latest {
+        let block_start = Instant::now();
         let end = cursor
             .saturating_add(batch_size.max(1))
             .saturating_sub(1)
             .min(latest);
-        let blocks = source.fetch_compact_blocks(cursor..end.saturating_add(1)).await?;
+        let blocks = source
+            .fetch_compact_blocks(cursor..end.saturating_add(1))
+            .await?;
         for block in blocks {
             stats.blocks_scanned = stats.blocks_scanned.saturating_add(1);
             scan_block_stateless(
@@ -62,6 +72,7 @@ pub async fn stateless_scan(
             )?;
         }
         cursor = end.saturating_add(1);
+        apply_smoothing(block_start, smoothing.as_ref()).await;
     }
     Ok(stats)
 }
@@ -164,4 +175,24 @@ fn build_orchard_note_stateless(
         witness: Vec::new(),
         position,
     })
+}
+
+async fn apply_smoothing(block_start: Instant, smoothing: Option<&SmoothingConfig>) {
+    if let Some(cfg) = smoothing {
+        for _ in 0..cfg.dummy_decryptions {
+            dummy_work();
+        }
+        let elapsed = block_start.elapsed();
+        if cfg.min_block_delay > elapsed {
+            sleep(cfg.min_block_delay - elapsed).await;
+        }
+    }
+}
+
+fn dummy_work() {
+    let mut acc: u64 = 0;
+    for i in 0..256u64 {
+        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i);
+    }
+    black_box(acc);
 }

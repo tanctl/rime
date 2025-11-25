@@ -9,14 +9,13 @@ use std::{
     },
 };
 
+use arti_client::TorClient;
 use bip0039::{Count, English, Mnemonic};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use humantime::parse_duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use prettytable::{Cell, Row, Table};
 use rand::{thread_rng, Rng};
-use arti_client::TorClient;
-use tor_rtcompat::PreferredRuntime;
 use rime_core::{
     decrypt_seed, encrypt_seed,
     keys::KeyManager,
@@ -27,12 +26,14 @@ use rime_core::{
 };
 use rime_lightclient::{
     create_pir_source, estimate_full_memo_bandwidth, rpc::RpcConfig, GrpcNoteSource, GrpcRpcClient,
-    NoteSource, PirNoteSource, RpcClient, TorConfig as LiteTorConfig, TorManager, WalletSyncer,
+    NoteSource, PirNoteSource, RpcClient, SmoothingConfig, TorConfig as LiteTorConfig, TorManager,
+    WalletSyncer,
 };
 use rpassword::prompt_password;
 use sapling::PaymentAddress as SaplingPaymentAddress;
 use serde_json::json;
 use std::time::{Duration, Instant};
+use tor_rtcompat::PreferredRuntime;
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::prelude::*;
@@ -58,6 +59,7 @@ struct Cli {
 
 static ORCHARD_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     Init(InitArgs),
@@ -79,7 +81,11 @@ struct InitArgs {
 
 #[derive(Debug, Args)]
 struct ImportUfvkArgs {
-    #[arg(long, value_name = "uview", help = "Unified full viewing key (uview) to import")]
+    #[arg(
+        long,
+        value_name = "uview",
+        help = "Unified full viewing key (uview) to import"
+    )]
     ufvk: String,
     #[arg(
         long,
@@ -95,6 +101,12 @@ struct SyncArgs {
     endpoint: String,
     #[arg(short, long, default_value_t = 100)]
     batch: u32,
+    #[arg(
+        long = "bucket-size",
+        value_name = "n",
+        help = "Round scan start/end heights down to this bucket size (default 1, no rounding)"
+    )]
+    bucket_size: Option<u32>,
     #[arg(
         short = 'm',
         long = "sync-mode",
@@ -165,6 +177,23 @@ struct SyncArgs {
         help = "Path to Tor cache directory (default: <data_dir>/tor/cache)"
     )]
     tor_cache_dir: Option<PathBuf>,
+    #[arg(
+        long = "const-cost",
+        help = "Pad per-block work with dummy decryptions and delay to flatten timing side-channels"
+    )]
+    const_cost: bool,
+    #[arg(
+        long = "min-block-delay",
+        value_name = "duration",
+        help = "Minimum per-block processing time when smoothing (eg 10ms)"
+    )]
+    min_block_delay: Option<String>,
+    #[arg(
+        long = "dummy-decryptions",
+        value_name = "n",
+        help = "Number of dummy decryptions per block when smoothing is enabled"
+    )]
+    dummy_decryptions: Option<u32>,
     #[arg(
         long = "stateless",
         help = "Perform a stateless scan: no DB (even in-memory) and no persisted state; notes are streamed and discarded"
@@ -291,6 +320,29 @@ impl SyncArgs {
             .validate()
             .map_err(|err| CliConfigError::new(err.to_string()))?;
         Ok(config)
+    }
+
+    fn bucket_size(&self) -> u32 {
+        self.bucket_size.unwrap_or(1).max(1)
+    }
+
+    fn smoothing_config(&self) -> Result<Option<SmoothingConfig>, CliConfigError> {
+        let enabled = self.const_cost
+            || self.min_block_delay.is_some()
+            || self.dummy_decryptions.unwrap_or(0) > 0;
+        if !enabled {
+            return Ok(None);
+        }
+        let min_block_delay = match &self.min_block_delay {
+            Some(raw) => parse_duration(raw)
+                .map_err(|err| CliConfigError::new(format!("invalid --min-block-delay: {err}")))?,
+            None => Duration::from_millis(0),
+        };
+        let dummy_decryptions = self.dummy_decryptions.unwrap_or(0);
+        Ok(Some(rime_lightclient::SmoothingConfig {
+            min_block_delay,
+            dummy_decryptions,
+        }))
     }
 
     fn ensure_no_pir_flags(&self) -> Result<(), CliConfigError> {
@@ -462,8 +514,11 @@ fn handle_init(args: InitArgs, data_dir: &Path) -> CliResult<()> {
 }
 
 fn handle_import_ufvk(args: ImportUfvkArgs, data_dir: &Path) -> CliResult<()> {
-    let ufvk = UnifiedFullViewingKey::decode_uview(&args.ufvk)
-        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let ufvk = UnifiedFullViewingKey::decode_uview(&args.ufvk).map_err(|e| {
+        boxed(io::Error::other(format!(
+            "invalid unified viewing key: {e}"
+        )))
+    })?;
     let birthday = args
         .birthday_height
         .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
@@ -515,6 +570,8 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     maybe_prompt_orchard_upgrade(&mut store, &mut wallet)?;
     let mut privacy = args.privacy_config().map_err(boxed)?;
     let sync_mode = privacy.sync_mode;
+    let bucket_size = args.bucket_size();
+    let smoothing = args.smoothing_config().map_err(boxed)?;
     info!(mode = ?sync_mode, "sync mode selected");
     if !matches!(
         sync_mode,
@@ -564,7 +621,10 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
         None
     };
     let rpc_cfg = args
-        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .rpc_config(
+            wallet.metadata.network,
+            tor_manager.as_ref().map(|m| m.client()),
+        )
         .map_err(boxed)?;
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
@@ -621,6 +681,8 @@ async fn handle_sync(args: SyncArgs, data_dir: &Path) -> CliResult<()> {
     let start = Instant::now();
     let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
         .with_batch_size(args.batch)
+        .with_bucket_size(bucket_size)
+        .with_smoothing(smoothing)
         .with_progress_callback(Arc::new(move |p| {
             progress_cb.set_message(format!(
                 "synced {} / {} (blocks {} sapling {} orchard {})",
@@ -667,8 +729,11 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
             "--ufvk is required when using --ephemeral",
         ))
     })?;
-    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str)
-        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str).map_err(|e| {
+        boxed(io::Error::other(format!(
+            "invalid unified viewing key: {e}"
+        )))
+    })?;
     let birthday = args
         .birthday_height
         .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
@@ -688,6 +753,8 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
     let wallet = Wallet::new(metadata, fvk, ivk, Some(ufvk));
 
     let mut privacy = args.privacy_config().map_err(boxed)?;
+    let bucket_size = args.bucket_size();
+    let smoothing = args.smoothing_config().map_err(boxed)?;
     if privacy.tor_only {
         ensure_not_local_endpoint(&args.endpoint)?;
         ensure_not_local_pir(&privacy)?;
@@ -712,7 +779,10 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
     };
 
     let rpc_cfg = args
-        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .rpc_config(
+            wallet.metadata.network,
+            tor_manager.as_ref().map(|m| m.client()),
+        )
         .map_err(boxed)?;
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
@@ -732,7 +802,9 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
 
     let store = WalletStore::in_memory().map_err(boxed)?;
     let mut syncer = WalletSyncer::new(wallet, note_source, store, privacy)
-        .with_batch_size(args.batch);
+        .with_batch_size(args.batch)
+        .with_bucket_size(bucket_size)
+        .with_smoothing(smoothing);
     let mut sapling_tree = NoteCommitmentTree::new();
     let mut orchard_tree = OrchardNoteCommitmentTree::new();
     let result = syncer
@@ -746,7 +818,10 @@ async fn handle_ephemeral_sync(args: SyncArgs, _data_dir: &Path) -> CliResult<()
     }
     println!(
         "Ephemeral sync complete: {} blocks, Sapling {}, Orchard {}, end height {}",
-        result.blocks_processed, result.notes_found_sapling, result.notes_found_orchard, result.end_height
+        result.blocks_processed,
+        result.notes_found_sapling,
+        result.notes_found_orchard,
+        result.end_height
     );
 
     for dir in tor_cleanup {
@@ -761,8 +836,11 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
             "--ufvk is required when using --stateless",
         ))
     })?;
-    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str)
-        .map_err(|e| boxed(io::Error::other(format!("invalid unified viewing key: {e}"))))?;
+    let ufvk = UnifiedFullViewingKey::decode_uview(&ufvk_str).map_err(|e| {
+        boxed(io::Error::other(format!(
+            "invalid unified viewing key: {e}"
+        )))
+    })?;
     let birthday = args
         .birthday_height
         .unwrap_or_else(|| sapling_activation_height(ufvk.network()));
@@ -782,6 +860,8 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
     let wallet = Wallet::new(metadata, fvk, ivk, Some(ufvk));
 
     let mut privacy = args.privacy_config().map_err(boxed)?;
+    let bucket_size = args.bucket_size();
+    let smoothing = args.smoothing_config().map_err(boxed)?;
     if privacy.tor_only {
         ensure_not_local_endpoint(&args.endpoint)?;
         ensure_not_local_pir(&privacy)?;
@@ -806,7 +886,10 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
     };
 
     let rpc_cfg = args
-        .rpc_config(wallet.metadata.network, tor_manager.as_ref().map(|m| m.client()))
+        .rpc_config(
+            wallet.metadata.network,
+            tor_manager.as_ref().map(|m| m.client()),
+        )
         .map_err(boxed)?;
     let rpc_client = GrpcRpcClient::connect(rpc_cfg).await?;
     let rpc: Arc<dyn RpcClient> = Arc::new(rpc_client);
@@ -836,6 +919,8 @@ async fn handle_stateless(args: SyncArgs) -> CliResult<()> {
         note_source,
         start_height,
         args.batch,
+        bucket_size,
+        smoothing,
         |note| {
             total = total.saturating_add(1);
             match note.pool {
@@ -1046,7 +1131,11 @@ fn prepare_data_dir(path: PathBuf) -> PathBuf {
     path
 }
 
-fn init_tracing(data_dir: &Path, verbose: bool, disable_logs: bool) -> CliResult<Option<WorkerGuard>> {
+fn init_tracing(
+    data_dir: &Path,
+    verbose: bool,
+    disable_logs: bool,
+) -> CliResult<Option<WorkerGuard>> {
     let level = if verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
     if disable_logs {
@@ -1281,13 +1370,11 @@ fn memo_display(note: &rime_core::Note) -> String {
 }
 
 fn dump_notes(notes: &[rime_core::Note]) {
-    let payload: Vec<_> = notes
-        .iter()
-        .map(|note| {
-            note_to_json(note)
-        })
-        .collect();
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".into()));
+    let payload: Vec<_> = notes.iter().map(note_to_json).collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".into())
+    );
 }
 
 fn note_to_json(note: &rime_core::Note) -> serde_json::Value {
@@ -1306,7 +1393,10 @@ fn note_to_json(note: &rime_core::Note) -> serde_json::Value {
 }
 
 fn print_note_json(note: &rime_core::Note) {
-    println!("{}", serde_json::to_string(&note_to_json(note)).unwrap_or_else(|_| "{}".into()));
+    println!(
+        "{}",
+        serde_json::to_string(&note_to_json(note)).unwrap_or_else(|_| "{}".into())
+    );
 }
 
 fn shorten_address(addr: &str) -> String {
@@ -1434,9 +1524,13 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let km = KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Testnet)
+        let km =
+            KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Testnet).unwrap();
+        let ufvk = km
+            .unified_full_viewing_key()
+            .unwrap()
+            .encode_uview()
             .unwrap();
-        let ufvk = km.unified_full_viewing_key().unwrap().encode_uview().unwrap();
         handle_import_ufvk(
             ImportUfvkArgs {
                 ufvk: ufvk.clone(),
@@ -1460,9 +1554,13 @@ mod tests {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let km = KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Mainnet)
+        let km =
+            KeyManager::from_mnemonic_with_network(sample_phrase(), "", Network::Mainnet).unwrap();
+        let ufvk = km
+            .unified_full_viewing_key()
+            .unwrap()
+            .encode_uview()
             .unwrap();
-        let ufvk = km.unified_full_viewing_key().unwrap().encode_uview().unwrap();
         handle_import_ufvk(
             ImportUfvkArgs {
                 ufvk: ufvk.clone(),

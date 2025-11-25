@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, io::Cursor, sync::Arc};
+use std::{convert::TryFrom, hint::black_box, io::Cursor, sync::Arc, time::Instant};
 
 use crate::full_memo::{FullMemoSyncer, OrchardMemoEntry, SyncStats};
 use crate::rpc::{CompactBlock, CompactOrchardAction, CompactSaplingOutput, TreeState};
@@ -38,6 +38,7 @@ use sapling::{
     PaymentAddress,
 };
 use thiserror::Error;
+use tokio::time::sleep;
 use tracing::warn;
 use zcash_client_backend::proto::service as backend_service;
 use zcash_note_encryption::{
@@ -307,6 +308,25 @@ pub enum SyncError {
 
 type ProgressCallback = Arc<dyn Fn(SyncProgress) + Send + Sync>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct SmoothingConfig {
+    pub min_block_delay: std::time::Duration,
+    pub dummy_decryptions: u32,
+}
+
+pub(crate) fn round_end_height(latest_raw: u32, bucket: u32) -> u32 {
+    let bucket = bucket.max(1);
+    if bucket == 1 {
+        return latest_raw;
+    }
+    let ceil = latest_raw
+        .saturating_add(bucket.saturating_sub(1))
+        .checked_div(bucket)
+        .unwrap_or(0);
+    let rounded = ceil.saturating_mul(bucket).saturating_sub(1);
+    rounded.min(latest_raw)
+}
+
 pub struct WalletSyncer {
     wallet: Wallet,
     source: Arc<dyn NoteSource>,
@@ -318,6 +338,8 @@ pub struct WalletSyncer {
     verify_headers: bool,
     privacy: PrivacyConfig,
     full_memo: Option<FullMemoSyncer>,
+    bucket_size: u32,
+    smoothing: Option<SmoothingConfig>,
 }
 
 impl WalletSyncer {
@@ -348,11 +370,23 @@ impl WalletSyncer {
             verify_headers: true,
             privacy,
             full_memo,
+            bucket_size: 1,
+            smoothing: None,
         }
     }
 
     pub fn with_batch_size(mut self, size: u32) -> Self {
         self.batch_size = size.max(1);
+        self
+    }
+
+    pub fn with_bucket_size(mut self, size: u32) -> Self {
+        self.bucket_size = size.max(1);
+        self
+    }
+
+    pub fn with_smoothing(mut self, config: Option<SmoothingConfig>) -> Self {
+        self.smoothing = config;
         self
     }
 
@@ -463,7 +497,9 @@ impl WalletSyncer {
         orchard_tree: &mut OrchardNoteCommitmentTree,
     ) -> Result<SyncResult, SyncError> {
         'resync: loop {
-            let latest = self.source.latest_height().await?;
+            let bucket = self.bucket_size.max(1);
+            let latest_raw = self.source.latest_height().await?;
+            let latest = round_end_height(latest_raw, bucket);
             let mut sapling_checkpoint_height =
                 self.wallet.metadata.birthday_height.saturating_sub(1);
             if let Some(cp) = self.store.load_latest_checkpoint(Pool::Sapling)? {
@@ -500,10 +536,8 @@ impl WalletSyncer {
             } else {
                 cursor = cursor.saturating_add(1);
             }
-
-            if cursor > latest {
-                return Ok(SyncResult::idle(cursor));
-            }
+            cursor = (cursor / bucket) * bucket;
+            // Always process at least the current bucket for privacy; don't early-return idle.
 
             if self.full_memo_enabled() {
                 tracing::info!(
@@ -542,6 +576,7 @@ impl WalletSyncer {
                     continue;
                 }
                 for mut block in blocks {
+                    let block_start = Instant::now();
                     let block_height = block.height as u32;
                     if self.full_memo_enabled() {
                         for tx in &block.vtx {
@@ -642,6 +677,7 @@ impl WalletSyncer {
                     if let Some(fm) = self.full_memo.as_mut() {
                         fm.stats.blocks_scanned = fm.stats.blocks_scanned.saturating_add(1);
                     }
+                    self.apply_smoothing(block_start).await;
                 }
                 cursor = end.saturating_add(1);
             }
@@ -674,6 +710,18 @@ impl WalletSyncer {
                 }
             }
             return Ok(summary);
+        }
+    }
+
+    async fn apply_smoothing(&self, block_start: Instant) {
+        if let Some(cfg) = &self.smoothing {
+            for _ in 0..cfg.dummy_decryptions {
+                dummy_work();
+            }
+            let elapsed = block_start.elapsed();
+            if cfg.min_block_delay > elapsed {
+                sleep(cfg.min_block_delay - elapsed).await;
+            }
         }
     }
 
@@ -1030,16 +1078,6 @@ pub struct SyncResult {
 }
 
 impl SyncResult {
-    fn idle(height: u32) -> Self {
-        Self {
-            blocks_processed: 0,
-            notes_found_sapling: 0,
-            notes_found_orchard: 0,
-            start_height: height,
-            end_height: height,
-        }
-    }
-
     pub fn total_notes(&self) -> u32 {
         self.notes_found_sapling + self.notes_found_orchard
     }
@@ -1292,6 +1330,15 @@ fn cache_orchard_actions(fm: &mut FullMemoSyncer, txid: [u8; 32], tx: &Transacti
             fm.cache_orchard(txid, idx as u32, entry);
         }
     }
+}
+
+fn dummy_work() {
+    // Smol CPU-bound loop to normalize per-block cost without altering state.
+    let mut acc: u64 = 0;
+    for i in 0..256u64 {
+        acc = acc.wrapping_mul(6364136223846793005).wrapping_add(i);
+    }
+    black_box(acc);
 }
 
 fn recover_orchard_memo(
